@@ -182,11 +182,20 @@ gcloud run jobs create "$JOB_NAME" \
   --max-retries=1 \
   --memory=1Gi \
   --cpu=1 \
-  --set-env-vars="GMAIL_USER_EMAIL=itdocumentation@forbesmarshall.com,EMAIL_SUBJECT=FM Orders Bulletin,GEMINI_MODEL=gemini-2.0-flash,SHEET_RANGE=Sheet1" \
+  --set-env-vars="GMAIL_USER_EMAIL=itdocumentation@forbesmarshall.com,EMAIL_SUBJECT=FM Orders Bulletin,GEMINI_MODEL=gemini-3.1-pro-preview,SHEET_RANGE=Sheet1,TEMPLATE_SHEET_ID=17YLBsDFyJ3ejKc3y12hNd6mb1htcwovRR0lXiUrux4U,TEMPLATE_WORKSHEET_GID=1145057086,DRIVE_PARENT_FOLDER_ID=0AFfpBsQN7VH4Uk9PVA" \
   --set-secrets="GEMINI_API_KEY=gemini-api-key:latest,GOOGLE_SERVICE_ACCOUNT_JSON=google-sa-json:latest,GOOGLE_SHEET_ID=google-sheet-id:latest"
 ```
 
 **Console:** Cloud Run → Jobs → Create → select image → Variables & Secrets → map secrets to env vars as above.
+
+### Drive location for the monthly files
+
+`DRIVE_PARENT_FOLDER_ID` must point at a **Shared Drive** (or a folder inside one), and the
+runtime service account must be added to that Shared Drive as **Content Manager**. A regular
+My Drive folder does not work — the service account has no Drive storage quota of its own, so
+copying the template there fails with `storageQuotaExceeded`. The only alternative is to set
+`DRIVE_IMPERSONATE_USER` and grant the service account domain-wide delegation for
+`https://www.googleapis.com/auth/drive`, so files are created under that user's quota instead.
 
 ### Manual test run
 
@@ -259,7 +268,7 @@ gcloud scheduler jobs run fm-orders-daily-905 --location="$REGION"
 | `GOOGLE_SHEET_ID` | Secret `google-sheet-id` | Target spreadsheet |
 | `GMAIL_USER_EMAIL` | Env | Mailbox to impersonate |
 | `EMAIL_SUBJECT` | Env | Exact subject: `FM Orders Bulletin` |
-| `GEMINI_MODEL` | Env | Default `gemini-2.0-flash` |
+| `GEMINI_MODEL` | Env | Default `gemini-3.1-pro-preview` |
 | `SHEET_RANGE` | Env | Worksheet name (default `Sheet1`) |
 
 ---

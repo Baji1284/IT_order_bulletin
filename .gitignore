@@ -9,3 +9,5 @@ __pycache__/
 venv/
 .idea/
 .vscode/
+*.xlsx
+_inspect_template.py

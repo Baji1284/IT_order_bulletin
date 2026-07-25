@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FM Orders Bulletin — daily PDF email → Gemini extraction → Google Sheet.
+FM Orders Bulletin - daily PDF email ? Gemini extraction ? Google Sheet.
 
 Designed as a Cloud Run Job entrypoint (no HTTP server).
 All secrets are injected via environment variables from Secret Manager.
@@ -14,7 +14,10 @@ import logging
 import os
 import re
 import sys
+from datetime import date, datetime
+from calendar import monthrange
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import gspread
 from google import genai
@@ -22,6 +25,7 @@ from google.auth.transport.requests import Request
 from google.genai import types
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,15 +42,48 @@ GMAIL_USER_EMAIL = os.environ.get(
     "GMAIL_USER_EMAIL", "itdocumentation@forbesmarshall.com"
 )
 EMAIL_SUBJECT = os.environ.get("EMAIL_SUBJECT", "FM Orders Bulletin")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
-SHEET_RANGE = os.environ.get("SHEET_RANGE", "Sheet1")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview").strip()
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_APPLICATION_CREDENTIALS = os.environ.get(
+    "GOOGLE_APPLICATION_CREDENTIALS", ""
+).strip()
+IST = ZoneInfo("Asia/Kolkata")
+MONTHLY_TAB_SUFFIX = os.environ.get("MONTHLY_TAB_SUFFIX", "_order_bulletin").strip()
+
+# Formatted Order Bulletin template (Google Sheet matching the xlsx layout)
+TEMPLATE_SHEET_ID = os.environ.get("TEMPLATE_SHEET_ID", "").strip()
+TEMPLATE_WORKSHEET_NAME = os.environ.get("TEMPLATE_WORKSHEET_NAME", "Template").strip()
+TEMPLATE_WORKSHEET_GID = os.environ.get("TEMPLATE_WORKSHEET_GID", "1145057086").strip()
+# Dynamic current-month block (APRIL'26 section in the template = cols X-AA)
+TEMPLATE_MONTH_HEADER_CELL = os.environ.get("TEMPLATE_MONTH_HEADER_CELL", "X2").strip()
+TEMPLATE_HEADER_ROW = int(os.environ.get("TEMPLATE_HEADER_ROW", "3"))
+TEMPLATE_DATA_START_ROW = int(os.environ.get("TEMPLATE_DATA_START_ROW", "4"))
+TEMPLATE_COL_PROJ_INCL = os.environ.get("TEMPLATE_COL_PROJ_INCL", "X").strip()
+TEMPLATE_COL_PROJ_DIGI = os.environ.get("TEMPLATE_COL_PROJ_DIGI", "Y").strip()
+TEMPLATE_COL_ACH_INCL = os.environ.get("TEMPLATE_COL_ACH_INCL", "Z").strip()
+TEMPLATE_COL_ACH_DIGI = os.environ.get("TEMPLATE_COL_ACH_DIGI", "AA").strip()
+TEMPLATE_COL_SEGMENT = os.environ.get("TEMPLATE_COL_SEGMENT", "A").strip()
+TEMPLATE_COL_DIVISION = os.environ.get("TEMPLATE_COL_DIVISION", "B").strip()
+
+# One spreadsheet file per month, holding a dated tab for each day of that month
+DRIVE_PARENT_FOLDER_ID = os.environ.get("DRIVE_PARENT_FOLDER_ID", "").strip()
+# Service accounts own no Drive storage, so new files must be owned by a real user
+# (domain-wide delegation) or live in a Shared Drive.
+DRIVE_IMPERSONATE_USER = os.environ.get("DRIVE_IMPERSONATE_USER", "").strip()
+MONTHLY_FILE_SHARE_EMAILS = [
+    email.strip()
+    for email in os.environ.get("MONTHLY_FILE_SHARE_EMAILS", "").split(",")
+    if email.strip()
+]
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
 SYSTEM_INSTRUCTION = """You are an expert financial data extraction AI. I am providing a PDF containing a complex, multi-tier financial matrix (an Orders Bulletin) with hierarchical rows, vertically merged cells, and multi-level column headers.
 
@@ -78,6 +115,51 @@ Follow these rules EXACTLY:
 - DO NOT wrap it in markdown code blocks (no ```json or ```).
 - DO NOT include any explanations, greetings, or conversational text.
 - The very first character of your response must be "[" and the last must be "]".
+"""
+
+METRICS_SYSTEM_INSTRUCTION = """You are an expert financial data extraction AI for Forbes Marshall Orders Bulletins.
+
+You receive:
+1. The Orders Bulletin PDF.
+2. TEMPLATE_COLUMNS: the spreadsheet columns to fill, each with its column letter, the
+   section label above it (fiscal year or month block) and its full header text.
+3. TEMPLATE_ROWS: the spreadsheet rows to fill, each with its row number, market segment
+   and division label.
+
+Your task: for EVERY template row, map the matching PDF line item and return the value for
+EVERY template column, so that all numbers present in the bulletin land in the sheet.
+
+Return ONLY a JSON object with this exact shape:
+{
+  "month_header": "JULY'26",
+  "month_abbr": "Jul'26",
+  "rows": [
+    { "row": 4, "values": { "C": "12.34", "D": "1.23", "E": "", "I": "150.00" } }
+  ]
+}
+
+RULES:
+1. Identify the bulletin month from the PDF itself (title / headers / "updated at" date).
+   month_header = FULL MONTH NAME uppercase + apostrophe + 2-digit year (e.g. "JULY'26").
+   month_abbr = 3-letter title-case month + apostrophe + 2-digit year (e.g. "Jul'26").
+2. Use the "row" numbers exactly as given in TEMPLATE_ROWS. Never invent row numbers.
+3. Keys inside "values" MUST be the column letters from TEMPLATE_COLUMNS.
+4. Match each template row to the PDF line item using the segment + division labels, including
+   hierarchy (e.g. Process Domestic FMPL -> Mech Std) and total/summary rows
+   (e.g. "PROCESS DOMESTIC TOTAL ( FMPL) :").
+5. Match each template column to the correct PDF column using the section label AND header text:
+   - Fiscal-year blocks (e.g. "2025- 2026", "2026 - 2027") map to the corresponding
+     year-to-date / total / target / growth / % achievement columns in the PDF.
+   - Month blocks map to that month's Projections and Achievement columns
+     (incl. Digital Business and for Digital Sustenance).
+   - "Achmnt (AVG)", "% Growth over ...", "% Achmnt to Target", "Target", "Target / Month"
+     and "Pro rata Target" must come from the equivalent PDF columns.
+6. NUMERICAL INTEGRITY: copy values EXACTLY as printed in the PDF. Never round, reformat,
+   recalculate, or derive a value. Keep decimals, negative signs and % signs as shown
+   (e.g. "-0.54", "-86.28%"). Output every value as a JSON string.
+7. If the PDF has no value for a given row/column combination, use an empty string "".
+8. Include an entry for every row in TEMPLATE_ROWS, even if all its values are empty.
+9. Output ONLY valid JSON. No markdown fences, no commentary, no explanation.
 """
 
 def _require_env(name: str, value: str) -> str:
@@ -262,6 +344,94 @@ def extract_table_with_gemini(pdf_bytes: bytes) -> list[list[Any]]:
     return normalized
 
 
+def _now_ist(now: datetime | None = None) -> datetime:
+    when = now or datetime.now(IST)
+    if when.tzinfo is None:
+        return when.replace(tzinfo=IST)
+    return when.astimezone(IST)
+
+
+def current_month_tab_name(now: datetime | None = None) -> str:
+    """Return monthly worksheet title, e.g. Jul-2026_order_bulletin (IST)."""
+    when = _now_ist(now)
+    return f"{when.strftime('%b-%Y')}{MONTHLY_TAB_SUFFIX}"
+
+
+def day_tab_name(day: date) -> str:
+    """Daily sub-tab title, e.g. 01/07/2026."""
+    return day.strftime("%d/%m/%Y")
+
+
+def month_day_tab_names(year: int, month: int) -> list[str]:
+    """All daily tab names for a calendar month (01/MM/YYYY - last/MM/YYYY)."""
+    _, last_day = monthrange(year, month)
+    return [day_tab_name(date(year, month, d)) for d in range(1, last_day + 1)]
+
+
+def _worksheet_titles(spreadsheet: gspread.Spreadsheet) -> set[str]:
+    return {ws.title for ws in spreadsheet.worksheets()}
+
+
+def ensure_month_tabs(spreadsheet: gspread.Spreadsheet, now: datetime | None = None) -> str:
+    """
+    Ensure the monthly main tab and every daily date tab for the IST month exist.
+
+    Google Sheets cannot nest tabs, so daily "sub-tabs" are sibling worksheets
+    named DD/MM/YYYY under the same spreadsheet as Jul-2026_order_bulletin.
+    """
+    when = _now_ist(now)
+    monthly_name = current_month_tab_name(when)
+    day_names = month_day_tab_names(when.year, when.month)
+
+    existing = _worksheet_titles(spreadsheet)
+    to_create: list[str] = []
+    if monthly_name not in existing:
+        to_create.append(monthly_name)
+    for name in day_names:
+        if name not in existing:
+            to_create.append(name)
+
+    if to_create:
+        logger.info(
+            "Creating %d missing tab(s) for %s: monthly=%s, days=%d",
+            len(to_create),
+            when.strftime("%b-%Y"),
+            monthly_name not in existing,
+            sum(1 for n in to_create if n != monthly_name),
+        )
+        # Batch create to avoid many sequential API calls
+        requests = [
+            {
+                "addSheet": {
+                    "properties": {
+                        "title": title,
+                        "gridProperties": {"rowCount": 200, "columnCount": 40},
+                    }
+                }
+            }
+            for title in to_create
+        ]
+        spreadsheet.batch_update({"requests": requests})
+    else:
+        logger.info(
+            "All monthly/daily tabs already exist for %s (%d day tabs + main)",
+            monthly_name,
+            len(day_names),
+        )
+
+    return monthly_name
+
+
+def _clear_and_write(worksheet: gspread.Worksheet, values: list[list[str]]) -> None:
+    logger.info(
+        "Clearing worksheet %r and writing %d rows",
+        worksheet.title,
+        len(values),
+    )
+    worksheet.clear()
+    worksheet.update(values, value_input_option="RAW")
+
+
 def write_to_sheet(rows: list[list[Any]]) -> None:
     sheet_id = _require_env("GOOGLE_SHEET_ID", GOOGLE_SHEET_ID)
     sheets_creds = load_sheets_credentials()
@@ -271,26 +441,529 @@ def write_to_sheet(rows: list[list[Any]]) -> None:
     gc = gspread.authorize(sheets_creds)
     spreadsheet = gc.open_by_key(sheet_id)
 
-    worksheet_name = SHEET_RANGE.split("!")[0].strip() or "Sheet1"
-    try:
-        worksheet = spreadsheet.worksheet(worksheet_name)
-    except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.get_worksheet(0)
-        logger.warning(
-            "Worksheet %r not found; using first sheet %r",
-            worksheet_name,
-            worksheet.title,
-        )
+    when = _now_ist()
+    monthly_name = ensure_month_tabs(spreadsheet, when)
+    today_name = day_tab_name(when.date())
 
-    # Strings preserve exact numeric text from the PDF / Gemini output
     values = [["" if c is None else str(c) for c in row] for row in rows]
 
+    # Daily sub-tab: today's bulletin snapshot for this date
+    daily_ws = spreadsheet.worksheet(today_name)
+    _clear_and_write(daily_ws, values)
+
+    # Monthly main tab: latest cumulative bulletin for the month
+    monthly_ws = spreadsheet.worksheet(monthly_name)
+    _clear_and_write(monthly_ws, values)
+
     logger.info(
-        "Clearing worksheet %r and writing %d rows", worksheet.title, len(values)
+        "Google Sheet updated successfully on daily tab %r and monthly main %r",
+        today_name,
+        monthly_name,
     )
-    worksheet.clear()
-    worksheet.update(values, value_input_option="RAW")
-    logger.info("Google Sheet updated successfully")
+
+
+def _parse_json_response(text: str) -> Any:
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned an empty response")
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.error("Gemini raw response (truncated): %s", text[:2000])
+        raise RuntimeError(f"Gemini did not return valid JSON: {exc}") from exc
+
+
+def _month_labels_from_ist(now: datetime | None = None) -> tuple[str, str]:
+    when = _now_ist(now)
+    full = when.strftime("%B").upper() + "'" + when.strftime("%y")
+    abbr = when.strftime("%b") + "'" + when.strftime("%y")
+    return full, abbr
+
+
+def _col_to_index(col: str) -> int:
+    """A -> 1, Z -> 26, AA -> 27."""
+    idx = 0
+    for ch in col.strip().upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def _index_to_col(idx: int) -> str:
+    col = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        col = chr(ord("A") + rem) + col
+    return col
+
+
+def extract_metrics_with_gemini(
+    pdf_bytes: bytes,
+    template_columns: list[dict[str, str]],
+    template_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Ask Gemini to fill every template column for every template row."""
+    _require_env("GEMINI_API_KEY", GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    logger.info(
+        "Extracting template metrics via Gemini model=%s (%d cols x %d rows)",
+        GEMINI_MODEL,
+        len(template_columns),
+        len(template_rows),
+    )
+    context = json.dumps(
+        {"TEMPLATE_COLUMNS": template_columns, "TEMPLATE_ROWS": template_rows},
+        ensure_ascii=False,
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_bytes(
+                        data=pdf_bytes, mime_type="application/pdf"
+                    ),
+                    types.Part.from_text(
+                        text=(
+                            "Fill the Order Bulletin template. Return a value for every "
+                            "column of every row listed below.\n\n" + context
+                        )
+                    ),
+                ],
+            )
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=METRICS_SYSTEM_INSTRUCTION,
+            temperature=0.0,
+            response_mime_type="application/json",
+        ),
+    )
+    data = _parse_json_response(response.text)
+    if not isinstance(data, dict):
+        raise RuntimeError("Expected a JSON object from Gemini metrics extraction")
+
+    fallback_full, fallback_abbr = _month_labels_from_ist()
+    month_header = str(data.get("month_header") or fallback_full).strip()
+    month_abbr = str(data.get("month_abbr") or fallback_abbr).strip()
+
+    valid_rows = {int(item["row"]) for item in template_rows}
+    valid_cols = {item["col"] for item in template_columns}
+
+    normalized_rows: list[dict[str, Any]] = []
+    for row in data.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_num = int(row.get("row"))
+        except (TypeError, ValueError):
+            continue
+        if row_num not in valid_rows:
+            continue
+        values = row.get("values")
+        if not isinstance(values, dict):
+            continue
+        clean = {
+            str(col).strip().upper(): ("" if val is None else str(val))
+            for col, val in values.items()
+            if str(col).strip().upper() in valid_cols
+        }
+        if clean:
+            normalized_rows.append({"row": row_num, "values": clean})
+
+    filled = sum(1 for r in normalized_rows for v in r["values"].values() if v != "")
+    logger.info(
+        "Extracted metrics for %s: %d rows, %d populated cells",
+        month_header,
+        len(normalized_rows),
+        filled,
+    )
+    return {
+        "month_header": month_header,
+        "month_abbr": month_abbr,
+        "rows": normalized_rows,
+    }
+
+
+def _get_master_template_worksheet(spreadsheet: gspread.Spreadsheet) -> gspread.Worksheet:
+    """Locate the blank formatted master tab (by name, then by gid)."""
+    try:
+        return spreadsheet.worksheet(TEMPLATE_WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        pass
+
+    if TEMPLATE_WORKSHEET_GID:
+        try:
+            gid = int(TEMPLATE_WORKSHEET_GID)
+            for ws in spreadsheet.worksheets():
+                if ws.id == gid:
+                    return ws
+        except ValueError:
+            pass
+
+    logger.warning(
+        "Template worksheet %r not found in %r; using first sheet",
+        TEMPLATE_WORKSHEET_NAME,
+        spreadsheet.title,
+    )
+    return spreadsheet.get_worksheet(0)
+
+
+def load_drive_credentials() -> service_account.Credentials:
+    """Drive credentials, impersonating a real user when configured."""
+    info = _load_sa_info()
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=SHEETS_SCOPES
+    )
+    if DRIVE_IMPERSONATE_USER:
+        logger.info("Using Drive impersonation for %s", DRIVE_IMPERSONATE_USER)
+        return creds.with_subject(DRIVE_IMPERSONATE_USER)
+    return creds
+
+
+def get_drive_service(creds: service_account.Credentials):
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _service_account_email() -> str:
+    return str(_load_sa_info().get("client_email") or "")
+
+
+def _find_spreadsheet_by_name(drive, name: str) -> str | None:
+    clauses = [
+        f"name = '{name.replace(chr(39), chr(92) + chr(39))}'",
+        f"mimeType = '{SPREADSHEET_MIME}'",
+        "trashed = false",
+    ]
+    if DRIVE_PARENT_FOLDER_ID:
+        clauses.append(f"'{DRIVE_PARENT_FOLDER_ID}' in parents")
+    response = (
+        drive.files()
+        .list(
+            q=" and ".join(clauses),
+            fields="files(id,name)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    files = response.get("files") or []
+    return files[0]["id"] if files else None
+
+
+def _prune_to_master_tab(spreadsheet: gspread.Spreadsheet) -> None:
+    """A fresh monthly file should start with only the blank master tab."""
+    master = _get_master_template_worksheet(spreadsheet)
+    for ws in spreadsheet.worksheets():
+        if ws.id != master.id:
+            logger.info("Removing copied tab %r from new monthly file", ws.title)
+            spreadsheet.del_worksheet(ws)
+
+
+def get_or_create_monthly_spreadsheet(
+    drive, gc: gspread.Client, file_name: str
+) -> gspread.Spreadsheet:
+    """One spreadsheet file per month, copied from the master template file."""
+    existing_id = _find_spreadsheet_by_name(drive, file_name)
+    if existing_id:
+        logger.info("Reusing monthly file %r (%s)", file_name, existing_id)
+        return gc.open_by_key(existing_id)
+
+    body: dict[str, Any] = {"name": file_name}
+    if DRIVE_PARENT_FOLDER_ID:
+        body["parents"] = [DRIVE_PARENT_FOLDER_ID]
+    try:
+        created = (
+            drive.files()
+            .copy(
+                fileId=_require_env("TEMPLATE_SHEET_ID", TEMPLATE_SHEET_ID),
+                body=body,
+                fields="id,name",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        if "storageQuotaExceeded" in str(exc):
+            raise RuntimeError(
+                f"Cannot create monthly file {file_name!r}: the service account owns no "
+                "Drive storage. Set DRIVE_IMPERSONATE_USER (needs the Drive scope added "
+                "to domain-wide delegation), use a Shared Drive folder, or pre-create the "
+                "file by copying the template and naming it exactly as above."
+            ) from exc
+        raise
+
+    file_id = created["id"]
+    logger.info("Created monthly file %r (%s)", file_name, file_id)
+
+    # The job writes cell data as the plain service account, so it needs access too
+    grantees = list(MONTHLY_FILE_SHARE_EMAILS)
+    if DRIVE_IMPERSONATE_USER:
+        sa_email = _service_account_email()
+        if sa_email:
+            grantees.append(sa_email)
+    for email in grantees:
+        drive.permissions().create(
+            fileId=file_id,
+            body={"type": "user", "role": "writer", "emailAddress": email},
+            sendNotificationEmail=False,
+            supportsAllDrives=True,
+        ).execute()
+        logger.info("Shared monthly file with %s", email)
+
+    spreadsheet = gc.open_by_key(file_id)
+    _prune_to_master_tab(spreadsheet)
+    return spreadsheet
+
+
+def _get_or_create_dated_template_tab(
+    spreadsheet: gspread.Spreadsheet,
+    master_ws: gspread.Worksheet,
+    tab_name: str,
+) -> gspread.Worksheet:
+    """Duplicate the master template into a date-named tab (formatting preserved)."""
+    try:
+        worksheet = spreadsheet.worksheet(tab_name)
+        logger.info("Reusing existing dated template tab %r", tab_name)
+        return worksheet
+    except gspread.WorksheetNotFound:
+        logger.info(
+            "Duplicating master template %r into new tab %r",
+            master_ws.title,
+            tab_name,
+        )
+        return spreadsheet.duplicate_sheet(
+            source_sheet_id=master_ws.id,
+            new_sheet_name=tab_name,
+            insert_sheet_index=1,
+        )
+
+
+def _read_template_columns(worksheet: gspread.Worksheet) -> list[dict[str, str]]:
+    """Columns to fill: every column with a header, excluding the label columns."""
+    last_col = _index_to_col(min(worksheet.col_count, 40))
+    section_row, header_row = worksheet.batch_get(
+        [
+            f"A{TEMPLATE_HEADER_ROW - 1}:{last_col}{TEMPLATE_HEADER_ROW - 1}",
+            f"A{TEMPLATE_HEADER_ROW}:{last_col}{TEMPLATE_HEADER_ROW}",
+        ]
+    )
+    sections = section_row[0] if section_row else []
+    headers = header_row[0] if header_row else []
+
+    skip = {
+        _col_to_index(TEMPLATE_COL_SEGMENT),
+        _col_to_index(TEMPLATE_COL_DIVISION),
+    }
+    columns: list[dict[str, str]] = []
+    current_section = ""
+    for offset, header in enumerate(headers):
+        col_index = offset + 1
+        section = sections[offset] if offset < len(sections) else ""
+        if str(section).strip():
+            current_section = _clean_text(section)
+        if col_index in skip:
+            continue
+        header_text = _clean_text(header)
+        if not header_text:
+            continue
+        columns.append(
+            {
+                "col": _index_to_col(col_index),
+                "section": current_section,
+                "header": header_text,
+            }
+        )
+    return columns
+
+
+def _clean_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _update_month_headers(worksheet: gspread.Worksheet, month_header: str, month_abbr: str) -> None:
+    """Update APRIL'26-style section header and the four column titles."""
+    header_updates = [
+        {"range": TEMPLATE_MONTH_HEADER_CELL, "values": [[month_header]]},
+        {
+            "range": f"{TEMPLATE_COL_PROJ_INCL}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Projections\n{month_abbr}\n (incl. Digital Business)"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_PROJ_DIGI}{TEMPLATE_HEADER_ROW}",
+            "values": [["Projections\n for Digital Sustenance"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_ACH_INCL}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Achmnt \n {month_abbr}\n (incl. Digital Business)"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_ACH_DIGI}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Achmnt \n {month_abbr}\n  for Digital Sustenance"]],
+        },
+    ]
+    worksheet.batch_update(header_updates, value_input_option="RAW")
+    logger.info(
+        "Updated template month header %s=%r and column titles for %r",
+        TEMPLATE_MONTH_HEADER_CELL,
+        month_header,
+        month_abbr,
+    )
+
+
+def _read_template_rows(worksheet: gspread.Worksheet) -> list[dict[str, Any]]:
+    """Rows to fill, with their segment (col A) and division (col B) labels."""
+    last_row = min(max(worksheet.row_count, TEMPLATE_DATA_START_ROW), 120)
+    segments, divisions = worksheet.batch_get(
+        [
+            f"{TEMPLATE_COL_SEGMENT}{TEMPLATE_DATA_START_ROW}:{TEMPLATE_COL_SEGMENT}{last_row}",
+            f"{TEMPLATE_COL_DIVISION}{TEMPLATE_DATA_START_ROW}:{TEMPLATE_COL_DIVISION}{last_row}",
+        ]
+    )
+
+    rows: list[dict[str, Any]] = []
+    current_segment = ""
+    for offset in range(last_row - TEMPLATE_DATA_START_ROW + 1):
+        seg = _clean_text(
+            segments[offset][0] if offset < len(segments) and segments[offset] else ""
+        )
+        div = _clean_text(
+            divisions[offset][0] if offset < len(divisions) and divisions[offset] else ""
+        )
+        if seg:
+            current_segment = seg
+        if not seg and not div:
+            continue
+        rows.append(
+            {
+                "row": TEMPLATE_DATA_START_ROW + offset,
+                "segment": seg or current_segment,
+                "division": div,
+            }
+        )
+    return rows
+
+
+def _column_runs(cols: list[str]) -> list[tuple[str, str, list[str]]]:
+    """Group column letters into contiguous runs to minimise API ranges."""
+    indexed = sorted({_col_to_index(c) for c in cols})
+    runs: list[tuple[str, str, list[str]]] = []
+    start = prev = None
+    current: list[str] = []
+    for idx in indexed:
+        if start is None:
+            start = prev = idx
+            current = [_index_to_col(idx)]
+            continue
+        if idx == prev + 1:
+            current.append(_index_to_col(idx))
+            prev = idx
+            continue
+        runs.append((_index_to_col(start), _index_to_col(prev), current))
+        start = prev = idx
+        current = [_index_to_col(idx)]
+    if start is not None:
+        runs.append((_index_to_col(start), _index_to_col(prev), current))
+    return runs
+
+
+def _write_metric_values(
+    worksheet: gspread.Worksheet,
+    metrics: dict[str, Any],
+    template_columns: list[dict[str, str]],
+) -> tuple[int, int]:
+    """Write all extracted values, one batched range per contiguous column run."""
+    all_cols = [c["col"] for c in template_columns]
+    runs = _column_runs(all_cols)
+
+    updates: list[dict[str, Any]] = []
+    populated = 0
+    for row in metrics.get("rows") or []:
+        row_num = row["row"]
+        values = row["values"]
+        for first, last, cols in runs:
+            block = [values.get(col, "") for col in cols]
+            if not any(v != "" for v in block):
+                continue
+            updates.append(
+                {
+                    "range": f"{first}{row_num}:{last}{row_num}",
+                    "values": [block],
+                }
+            )
+            populated += sum(1 for v in block if v != "")
+
+    if updates:
+        worksheet.batch_update(updates, value_input_option="RAW")
+    return len(updates), populated
+
+
+def update_formatted_template(pdf_bytes: bytes) -> None:
+    """Fill a date-named tab inside this month's own spreadsheet file."""
+    if not TEMPLATE_SHEET_ID:
+        logger.warning("TEMPLATE_SHEET_ID not set; skipping formatted template update")
+        return
+
+    sheets_creds = load_sheets_credentials()
+    if not sheets_creds.valid:
+        sheets_creds.refresh(Request())
+    gc = gspread.authorize(sheets_creds)
+    drive = get_drive_service(load_drive_credentials())
+
+    when = _now_ist()
+    monthly_file_name = current_month_tab_name(when)
+    spreadsheet = get_or_create_monthly_spreadsheet(drive, gc, monthly_file_name)
+
+    master_ws = _get_master_template_worksheet(spreadsheet)
+    template_columns = _read_template_columns(master_ws)
+    template_rows = _read_template_rows(master_ws)
+    if not template_columns or not template_rows:
+        raise RuntimeError(
+            "Could not read template structure "
+            f"(cols={len(template_columns)}, rows={len(template_rows)})"
+        )
+
+    metrics = extract_metrics_with_gemini(pdf_bytes, template_columns, template_rows)
+
+    tab_name = day_tab_name(when.date())
+    worksheet = _get_or_create_dated_template_tab(spreadsheet, master_ws, tab_name)
+
+    # The master tab stays an empty formatted shell; data lives only in dated tabs
+    data_ranges = [
+        f"{first}{TEMPLATE_DATA_START_ROW}:{last}{min(master_ws.row_count, 120)}"
+        for first, last, _ in _column_runs([c["col"] for c in template_columns])
+    ]
+    master_ws.batch_clear(data_ranges)
+
+    month_header = str(metrics.get("month_header") or "")
+    month_abbr = str(metrics.get("month_abbr") or "")
+    if not month_header or not month_abbr:
+        month_header, month_abbr = _month_labels_from_ist()
+    _update_month_headers(worksheet, month_header, month_abbr)
+
+    # Fresh snapshot each run: clear only mapped columns, never the merged spacers
+    clear_end = min(worksheet.row_count, 120)
+    worksheet.batch_clear(
+        [
+            f"{first}{TEMPLATE_DATA_START_ROW}:{last}{clear_end}"
+            for first, last, _ in _column_runs([c["col"] for c in template_columns])
+        ]
+    )
+
+    ranges, populated = _write_metric_values(worksheet, metrics, template_columns)
+    logger.info(
+        "Monthly file %r tab %r filled: %d cells across %d ranges (%d cols x %d rows)",
+        monthly_file_name,
+        tab_name,
+        populated,
+        ranges,
+        len(template_columns),
+        len(template_rows),
+    )
 
 
 def run() -> None:
@@ -301,6 +974,7 @@ def run() -> None:
     pdf_bytes = download_pdf_attachment(gmail, message_id)
     rows = extract_table_with_gemini(pdf_bytes)
     write_to_sheet(rows)
+    update_formatted_template(pdf_bytes)
     logger.info("Job completed successfully")
 
 
