@@ -16,6 +16,7 @@ import re
 import sys
 from datetime import date, datetime
 from calendar import monthrange
+from email.message import EmailMessage
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -44,6 +45,14 @@ GMAIL_USER_EMAIL = os.environ.get(
 EMAIL_SUBJECT = os.environ.get("EMAIL_SUBJECT", "FM Orders Bulletin")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview").strip()
+GEMINI_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "65535"))
+# Thinking tokens come out of the same budget as the answer. Keeping each reply
+# small (see GEMINI_ROW_BATCH) leaves room to think, and thinking hard matters:
+# at "low" the model left roughly a third of the cells empty.
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "high").strip().lower()
+# The metrics JSON is asked for in row batches so one reply never hits the output
+# token ceiling and comes back truncated (= unparseable).
+GEMINI_ROW_BATCH = int(os.environ.get("GEMINI_ROW_BATCH", "25"))
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_APPLICATION_CREDENTIALS = os.environ.get(
@@ -78,7 +87,18 @@ MONTHLY_FILE_SHARE_EMAILS = [
     if email.strip()
 ]
 
+# Who gets the "today's bulletin is ready" mail with the link to the monthly file
+NOTIFY_EMAILS = [
+    email.strip()
+    for email in os.environ.get(
+        "NOTIFY_EMAILS", "bssali@forbesmarshall.com"
+    ).split(",")
+    if email.strip()
+]
+NOTIFY_FROM_EMAIL = os.environ.get("NOTIFY_FROM_EMAIL", GMAIL_USER_EMAIL).strip()
+
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+GMAIL_SEND_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -191,6 +211,15 @@ def load_gmail_credentials() -> service_account.Credentials:
     return creds.with_subject(GMAIL_USER_EMAIL)
 
 
+def load_gmail_send_credentials() -> service_account.Credentials:
+    """SA credentials delegated to send mail as the notification sender."""
+    info = _load_sa_info()
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=GMAIL_SEND_SCOPES
+    )
+    return creds.with_subject(NOTIFY_FROM_EMAIL or GMAIL_USER_EMAIL)
+
+
 def load_sheets_credentials() -> service_account.Credentials:
     """SA credentials for Sheets (share the sheet with the SA client_email)."""
     info = _load_sa_info()
@@ -281,6 +310,65 @@ def download_pdf_attachment(gmail, message_id: str) -> bytes:
     return base64.urlsafe_b64decode(data)
 
 
+def _generation_config(system_instruction: str) -> types.GenerateContentConfig:
+    kwargs: dict[str, Any] = {
+        "system_instruction": system_instruction,
+        "temperature": 0.0,
+        "response_mime_type": "application/json",
+        "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
+    }
+    if GEMINI_THINKING_LEVEL:
+        kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_level=GEMINI_THINKING_LEVEL
+        )
+    return types.GenerateContentConfig(**kwargs)
+
+
+def _finish_reason(response: Any) -> str:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return ""
+    reason = getattr(candidates[0], "finish_reason", None)
+    return getattr(reason, "name", None) or str(reason or "")
+
+
+def _generate_json(
+    client: genai.Client,
+    pdf_bytes: bytes,
+    prompt: str,
+    system_instruction: str,
+    label: str,
+) -> Any:
+    """Send the PDF to Gemini and parse the JSON reply, retrying once if truncated."""
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_bytes(
+                            data=pdf_bytes, mime_type="application/pdf"
+                        ),
+                        types.Part.from_text(text=prompt),
+                    ],
+                )
+            ],
+            config=_generation_config(system_instruction),
+        )
+        reason = _finish_reason(response)
+        if reason and reason.upper() not in {"STOP", "FINISH_REASON_STOP"}:
+            logger.warning("%s: Gemini stopped with reason=%s", label, reason)
+        try:
+            return _parse_json_response(response.text)
+        except RuntimeError as exc:
+            last_error = exc
+            logger.warning("%s: attempt %d gave unusable JSON: %s", label, attempt, exc)
+
+    raise RuntimeError(f"{label}: Gemini returned no valid JSON in 2 attempts") from last_error
+
+
 def extract_table_with_gemini(pdf_bytes: bytes) -> list[list[Any]]:
     _require_env("GEMINI_API_KEY", GEMINI_API_KEY)
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -288,40 +376,13 @@ def extract_table_with_gemini(pdf_bytes: bytes) -> list[list[Any]]:
     logger.info(
         "Sending PDF (%d bytes) to Gemini model=%s", len(pdf_bytes), GEMINI_MODEL
     )
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_bytes(
-                        data=pdf_bytes, mime_type="application/pdf"
-                    ),
-                    types.Part.from_text(
-                        text="Extract the Orders Bulletin table from this PDF."
-                    ),
-                ],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
+    data = _generate_json(
+        client,
+        pdf_bytes,
+        "Extract the Orders Bulletin table from this PDF.",
+        SYSTEM_INSTRUCTION,
+        "raw table",
     )
-
-    text = (response.text or "").strip()
-    if not text:
-        raise RuntimeError("Gemini returned an empty response")
-
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.error("Gemini raw response (truncated): %s", text[:2000])
-        raise RuntimeError(f"Gemini did not return valid JSON: {exc}") from exc
 
     if not isinstance(data, list):
         raise RuntimeError("Expected a JSON array of arrays from Gemini")
@@ -462,17 +523,58 @@ def write_to_sheet(rows: list[list[Any]]) -> None:
     )
 
 
+def _merge_json_documents(docs: list[Any]) -> Any:
+    """Gemini sometimes answers with several JSON documents in a row."""
+    if len(docs) == 1:
+        return docs[0]
+
+    logger.warning("Gemini returned %d JSON documents; merging them", len(docs))
+    if all(isinstance(doc, list) for doc in docs):
+        merged_list: list[Any] = []
+        for doc in docs:
+            merged_list.extend(doc)
+        return merged_list
+    if all(isinstance(doc, dict) for doc in docs):
+        merged: dict[str, Any] = dict(docs[0])
+        rows: list[Any] = []
+        for doc in docs:
+            part = doc.get("rows")
+            if isinstance(part, list):
+                rows.extend(part)
+        if rows:
+            merged["rows"] = rows
+        return merged
+    return docs[0]
+
+
 def _parse_json_response(text: str) -> Any:
     text = (text or "").strip()
     if not text:
         raise RuntimeError("Gemini returned an empty response")
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.error("Gemini raw response (truncated): %s", text[:2000])
-        raise RuntimeError(f"Gemini did not return valid JSON: {exc}") from exc
+
+    decoder = json.JSONDecoder()
+    docs: list[Any] = []
+    pos = 0
+    while pos < len(text):
+        while pos < len(text) and text[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(text):
+            break
+        try:
+            doc, pos = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError as exc:
+            if docs:
+                logger.warning("Ignoring unparseable tail after %d document(s): %s", len(docs), exc)
+                break
+            logger.error("Gemini raw response (truncated): %s", text[:2000])
+            raise RuntimeError(f"Gemini did not return valid JSON: {exc}") from exc
+        docs.append(doc)
+
+    if not docs:
+        raise RuntimeError("Gemini returned no JSON document")
+    return _merge_json_documents(docs)
 
 
 def _month_labels_from_ist(now: datetime | None = None) -> tuple[str, str]:
@@ -498,6 +600,31 @@ def _index_to_col(idx: int) -> str:
     return col
 
 
+def _request_metrics_batch(
+    client: genai.Client,
+    pdf_bytes: bytes,
+    template_columns: list[dict[str, str]],
+    rows_batch: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """One Gemini call for a slice of template rows."""
+    context = json.dumps(
+        {"TEMPLATE_COLUMNS": template_columns, "TEMPLATE_ROWS": rows_batch},
+        ensure_ascii=False,
+    )
+    label = f"metrics rows {rows_batch[0]['row']}-{rows_batch[-1]['row']}"
+    data = _generate_json(
+        client,
+        pdf_bytes,
+        "Fill the Order Bulletin template. Return a value for every "
+        "column of every row listed below.\n\n" + context,
+        METRICS_SYSTEM_INSTRUCTION,
+        label,
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{label}: expected a JSON object from Gemini")
+    return data
+
+
 def extract_metrics_with_gemini(
     pdf_bytes: bytes,
     template_columns: list[dict[str, str]],
@@ -506,71 +633,63 @@ def extract_metrics_with_gemini(
     """Ask Gemini to fill every template column for every template row."""
     _require_env("GEMINI_API_KEY", GEMINI_API_KEY)
     client = genai.Client(api_key=GEMINI_API_KEY)
+
+    batches = [
+        template_rows[i : i + GEMINI_ROW_BATCH]
+        for i in range(0, len(template_rows), GEMINI_ROW_BATCH)
+    ]
     logger.info(
-        "Extracting template metrics via Gemini model=%s (%d cols x %d rows)",
+        "Extracting template metrics via Gemini model=%s (%d cols x %d rows in %d batch(es))",
         GEMINI_MODEL,
         len(template_columns),
         len(template_rows),
+        len(batches),
     )
-    context = json.dumps(
-        {"TEMPLATE_COLUMNS": template_columns, "TEMPLATE_ROWS": template_rows},
-        ensure_ascii=False,
-    )
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_bytes(
-                        data=pdf_bytes, mime_type="application/pdf"
-                    ),
-                    types.Part.from_text(
-                        text=(
-                            "Fill the Order Bulletin template. Return a value for every "
-                            "column of every row listed below.\n\n" + context
-                        )
-                    ),
-                ],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=METRICS_SYSTEM_INSTRUCTION,
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
-    )
-    data = _parse_json_response(response.text)
-    if not isinstance(data, dict):
-        raise RuntimeError("Expected a JSON object from Gemini metrics extraction")
-
-    fallback_full, fallback_abbr = _month_labels_from_ist()
-    month_header = str(data.get("month_header") or fallback_full).strip()
-    month_abbr = str(data.get("month_abbr") or fallback_abbr).strip()
 
     valid_rows = {int(item["row"]) for item in template_rows}
     valid_cols = {item["col"] for item in template_columns}
-
+    fallback_full, fallback_abbr = _month_labels_from_ist()
+    month_header = ""
+    month_abbr = ""
     normalized_rows: list[dict[str, Any]] = []
-    for row in data.get("rows") or []:
-        if not isinstance(row, dict):
-            continue
-        try:
-            row_num = int(row.get("row"))
-        except (TypeError, ValueError):
-            continue
-        if row_num not in valid_rows:
-            continue
-        values = row.get("values")
-        if not isinstance(values, dict):
-            continue
-        clean = {
-            str(col).strip().upper(): ("" if val is None else str(val))
-            for col, val in values.items()
-            if str(col).strip().upper() in valid_cols
-        }
-        if clean:
-            normalized_rows.append({"row": row_num, "values": clean})
+
+    for index, rows_batch in enumerate(batches, start=1):
+        data = _request_metrics_batch(client, pdf_bytes, template_columns, rows_batch)
+        month_header = month_header or str(data.get("month_header") or "").strip()
+        month_abbr = month_abbr or str(data.get("month_abbr") or "").strip()
+
+        batch_rows = 0
+        for row in data.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                row_num = int(row.get("row"))
+            except (TypeError, ValueError):
+                continue
+            if row_num not in valid_rows:
+                continue
+            values = row.get("values")
+            if not isinstance(values, dict):
+                continue
+            clean = {
+                str(col).strip().upper(): ("" if val is None else str(val))
+                for col, val in values.items()
+                if str(col).strip().upper() in valid_cols
+            }
+            if clean:
+                normalized_rows.append({"row": row_num, "values": clean})
+                batch_rows += 1
+        logger.info(
+            "Batch %d/%d (rows %s-%s): %d rows returned",
+            index,
+            len(batches),
+            rows_batch[0]["row"],
+            rows_batch[-1]["row"],
+            batch_rows,
+        )
+
+    month_header = month_header or fallback_full
+    month_abbr = month_abbr or fallback_abbr
 
     filled = sum(1 for r in normalized_rows for v in r["values"].values() if v != "")
     logger.info(
@@ -902,11 +1021,11 @@ def _write_metric_values(
     return len(updates), populated
 
 
-def update_formatted_template(pdf_bytes: bytes) -> None:
+def update_formatted_template(pdf_bytes: bytes) -> dict[str, Any] | None:
     """Fill a date-named tab inside this month's own spreadsheet file."""
     if not TEMPLATE_SHEET_ID:
         logger.warning("TEMPLATE_SHEET_ID not set; skipping formatted template update")
-        return
+        return None
 
     sheets_creds = load_sheets_credentials()
     if not sheets_creds.valid:
@@ -964,6 +1083,71 @@ def update_formatted_template(pdf_bytes: bytes) -> None:
         len(template_columns),
         len(template_rows),
     )
+    return {
+        "file_name": monthly_file_name,
+        "file_id": spreadsheet.id,
+        "tab_name": tab_name,
+        "tab_gid": worksheet.id,
+        "month_header": month_header,
+        "populated": populated,
+    }
+
+
+def _notification_message(result: dict[str, Any], recipients: list[str]) -> EmailMessage:
+    file_url = (
+        f"https://docs.google.com/spreadsheets/d/{result['file_id']}"
+        f"/edit#gid={result['tab_gid']}"
+    )
+    subject = f"FM Orders Bulletin - {result['tab_name']} ({result['file_name']})"
+    body = (
+        f"The Orders Bulletin for {result['tab_name']} has been extracted and written "
+        f"to the {result['month_header']} sheet.\n\n"
+        f"File: {result['file_name']}\n"
+        f"Tab: {result['tab_name']}\n"
+        f"Values filled: {result['populated']}\n\n"
+        f"Open it here: {file_url}\n\n"
+        "-- Automated message from the FM Orders Bulletin job."
+    )
+
+    message = EmailMessage()
+    message["To"] = ", ".join(recipients)
+    message["From"] = NOTIFY_FROM_EMAIL or GMAIL_USER_EMAIL
+    message["Subject"] = subject
+    message.set_content(body)
+    message.add_alternative(
+        f"""<html><body>
+<p>The Orders Bulletin for <b>{result['tab_name']}</b> has been extracted and written to
+the <b>{result['month_header']}</b> sheet.</p>
+<ul>
+  <li>File: <b>{result['file_name']}</b></li>
+  <li>Tab: <b>{result['tab_name']}</b></li>
+  <li>Values filled: {result['populated']}</li>
+</ul>
+<p><a href="{file_url}">Open the bulletin</a></p>
+<p style="color:#888;font-size:12px">Automated message from the FM Orders Bulletin job.</p>
+</body></html>""",
+        subtype="html",
+    )
+    return message
+
+
+def send_bulletin_link_email(result: dict[str, Any]) -> None:
+    """Mail the link to the freshly written monthly file."""
+    if not NOTIFY_EMAILS:
+        logger.info("NOTIFY_EMAILS is empty; skipping notification mail")
+        return
+
+    message = _notification_message(result, NOTIFY_EMAILS)
+    gmail = get_gmail_service(load_gmail_send_credentials())
+    gmail.users().messages().send(
+        userId="me",
+        body={"raw": base64.urlsafe_b64encode(message.as_bytes()).decode()},
+    ).execute()
+    logger.info(
+        "Sent bulletin link for tab %r to %s",
+        result["tab_name"],
+        ", ".join(NOTIFY_EMAILS),
+    )
 
 
 def run() -> None:
@@ -974,7 +1158,14 @@ def run() -> None:
     pdf_bytes = download_pdf_attachment(gmail, message_id)
     rows = extract_table_with_gemini(pdf_bytes)
     write_to_sheet(rows)
-    update_formatted_template(pdf_bytes)
+    result = update_formatted_template(pdf_bytes)
+    if result:
+        # The sheet is already written, so a mail failure must not trigger a
+        # full retry of the (slow, paid) Gemini extraction.
+        try:
+            send_bulletin_link_email(result)
+        except Exception:
+            logger.exception("Could not send the bulletin link mail")
     logger.info("Job completed successfully")
 
 

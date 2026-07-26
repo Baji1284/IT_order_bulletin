@@ -95,12 +95,14 @@ Keep `sa-key.json` only long enough to create the secret, then delete the local 
 3. OAuth scopes (comma-separated):
 
    ```
-   https://www.googleapis.com/auth/gmail.readonly
+   https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.send
    ```
 
 4. Save.
 
-Without this step, the job cannot read `itdocumentation@forbesmarshall.com`.
+Without `gmail.readonly` the job cannot read `itdocumentation@forbesmarshall.com`. `gmail.send`
+is what lets it mail the link to the finished sheet (see `NOTIFY_EMAILS`); without it the
+notification step fails with `unauthorized_client` while the sheet is still written correctly.
 
 ### 2d. Share the Google Sheet
 
