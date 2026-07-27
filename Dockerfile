@@ -13,6 +13,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+# Field mapping is data, not config: it ships with the code it belongs to
+COPY ["ORDERS BULLETIN_data_mapping.xlsx", "./"]
 
 # Cloud Run Job executes this container command once and exits
 CMD ["python", "-u", "main.py"]

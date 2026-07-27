@@ -14,13 +14,14 @@ import logging
 import os
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from calendar import monthrange
 from email.message import EmailMessage
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import gspread
+import openpyxl
 from google import genai
 from google.auth.transport.requests import Request
 from google.genai import types
@@ -75,6 +76,28 @@ TEMPLATE_COL_ACH_INCL = os.environ.get("TEMPLATE_COL_ACH_INCL", "Z").strip()
 TEMPLATE_COL_ACH_DIGI = os.environ.get("TEMPLATE_COL_ACH_DIGI", "AA").strip()
 TEMPLATE_COL_SEGMENT = os.environ.get("TEMPLATE_COL_SEGMENT", "A").strip()
 TEMPLATE_COL_DIVISION = os.environ.get("TEMPLATE_COL_DIVISION", "B").strip()
+# Previous fiscal-year block headers (the full Apr-Mar year that has closed)
+TEMPLATE_PREV_FY_LABEL_CELL = os.environ.get("TEMPLATE_PREV_FY_LABEL_CELL", "C2").strip()
+TEMPLATE_COL_PREV_FY_TOTAL_ACHMNT = os.environ.get(
+    "TEMPLATE_COL_PREV_FY_TOTAL_ACHMNT", "C"
+).strip()
+TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE = os.environ.get(
+    "TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE", "D"
+).strip()
+TEMPLATE_COL_PREV_FY_GROWTH = os.environ.get("TEMPLATE_COL_PREV_FY_GROWTH", "F").strip()
+# Current fiscal-year block headers that name the months covered so far
+TEMPLATE_COL_FY_TOTAL_ACHMNT = os.environ.get("TEMPLATE_COL_FY_TOTAL_ACHMNT", "R").strip()
+TEMPLATE_COL_FY_DIGI_SUSTENANCE = os.environ.get(
+    "TEMPLATE_COL_FY_DIGI_SUSTENANCE", "S"
+).strip()
+TEMPLATE_COL_FY_GROWTH = os.environ.get("TEMPLATE_COL_FY_GROWTH", "U").strip()
+
+# Which PDF line feeds which template field (Vertical / Vertical Supply / tag / target)
+MAPPING_FILE = os.environ.get(
+    "MAPPING_FILE", "ORDERS BULLETIN_data_mapping.xlsx"
+).strip()
+MAPPING_SHEET = os.environ.get("MAPPING_SHEET", "").strip()
+MAPPING_TOTAL_LABELS = {"FMPL TOTAL", "JV TOTAL"}
 
 # One spreadsheet file per month, holding a dated tab for each day of that month
 DRIVE_PARENT_FOLDER_ID = os.environ.get("DRIVE_PARENT_FOLDER_ID", "").strip()
@@ -154,7 +177,7 @@ Return ONLY a JSON object with this exact shape:
   "month_header": "JULY'26",
   "month_abbr": "Jul'26",
   "rows": [
-    { "row": 4, "values": { "C": "12.34", "D": "1.23", "E": "", "I": "150.00" } }
+    { "row": 4, "tag": "SSD+PAPER", "values": { "C": "12.34", "D": "1.23", "E": "", "I": "150.00" } }
   ]
 }
 
@@ -164,9 +187,15 @@ RULES:
    month_abbr = 3-letter title-case month + apostrophe + 2-digit year (e.g. "Jul'26").
 2. Use the "row" numbers exactly as given in TEMPLATE_ROWS. Never invent row numbers.
 3. Keys inside "values" MUST be the column letters from TEMPLATE_COLUMNS.
-4. Match each template row to the PDF line item using the segment + division labels, including
-   hierarchy (e.g. Process Domestic FMPL -> Mech Std) and total/summary rows
-   (e.g. "PROCESS DOMESTIC TOTAL ( FMPL) :").
+4. Locating the PDF line for a TEMPLATE_ROWS item:
+   - When the item has "pdf_tag", read EXACTLY that line, inside the section named by
+     "pdf_section". Echo the tag back in "tag". Return ONLY that line's own numbers:
+     never add, merge or substitute another line, even if two items share a template row.
+   - When the item has no "pdf_tag", match on the segment + division labels instead,
+     including total/summary rows (e.g. "PROCESS DOMESTIC TOTAL ( FMPL) :"), and set
+     "tag" to "".
+   - An item appears once per PDF tag, so the same "row" may legitimately appear twice
+     with different tags. Return one object per item, keeping them separate.
 5. Match each template column to the correct PDF column using the section label AND header text:
    - Fiscal-year blocks (e.g. "2025- 2026", "2026 - 2027") map to the corresponding
      year-to-date / total / target / growth / % achievement columns in the PDF.
@@ -178,9 +207,47 @@ RULES:
    recalculate, or derive a value. Keep decimals, negative signs and % signs as shown
    (e.g. "-0.54", "-86.28%"). Output every value as a JSON string.
 7. If the PDF has no value for a given row/column combination, use an empty string "".
-8. Include an entry for every row in TEMPLATE_ROWS, even if all its values are empty.
+8. Include an entry for every item in TEMPLATE_ROWS, even if all its values are empty.
 9. Output ONLY valid JSON. No markdown fences, no commentary, no explanation.
 """
+
+SECTION_TOTALS_SYSTEM_INSTRUCTION = """You are an expert financial data extraction AI for Forbes Marshall Orders Bulletins.
+
+You receive:
+1. The Orders Bulletin PDF.
+2. TEMPLATE_COLUMNS: the spreadsheet columns to fill, each with its column letter, the
+   section label above it (fiscal year or month block) and its full header text.
+3. SECTIONS: the bulletin sections whose TOTAL line you must read. Each one gives its
+   "section" name, the "vertical" it sits under, and "detail_lines", the PDF line items
+   that belong to it. Use the vertical and the detail lines to identify the right block,
+   because names like "JV" repeat across verticals.
+
+Your task: for each section, find its total line in the PDF (e.g. "PROCESS DOMESTIC TOTAL
+( FMPL) :", "INTOPS - FMPL TOTAL :", "OPC DOMESTIC TOTAL") and return that line's value for
+every template column.
+
+Return ONLY a JSON object with this exact shape:
+{
+  "section_totals": [
+    { "section": "PROCESS DOMESTIC-FMPL", "values": { "C": "12.34", "R": "5.00" } }
+  ]
+}
+
+RULES:
+1. Echo the "section" string exactly as given in SECTIONS.
+1a. The total must be the one covering exactly that section's detail lines, in that vertical.
+2. Keys inside "values" MUST be the column letters from TEMPLATE_COLUMNS.
+3. Read the section's own total line only. Never add up the detail lines yourself and never
+   borrow another section's total.
+4. Match each template column to the correct PDF column using the section label AND header
+   text, exactly as for the detail rows.
+5. NUMERICAL INTEGRITY: copy values EXACTLY as printed in the PDF. Never round, reformat,
+   recalculate or derive a value. Keep decimals, negative signs and % signs as shown.
+   Output every value as a JSON string.
+6. If the PDF has no total for a section, return it with all values as empty strings "".
+7. Output ONLY valid JSON. No markdown fences, no commentary, no explanation.
+"""
+
 
 def _require_env(name: str, value: str) -> str:
     if not value:
@@ -584,6 +651,23 @@ def _month_labels_from_ist(now: datetime | None = None) -> tuple[str, str]:
     return full, abbr
 
 
+def _previous_month(now: datetime | None = None) -> datetime:
+    when = _now_ist(now)
+    return when.replace(day=1) - timedelta(days=1)
+
+
+def _closed_fiscal_year_end(now: datetime | None = None) -> int:
+    """
+    Year of the March that ended the last complete fiscal year.
+
+    Fiscal years run Apr-Mar, so a run in Jul 2026 sits in FY 2026-27 and the
+    closed one ended Mar 2026; a run in Jan 2027 is still in FY 2026-27, so the
+    closed year is that same Mar 2026.
+    """
+    when = _now_ist(now)
+    return when.year if when.month >= 4 else when.year - 1
+
+
 def _col_to_index(col: str) -> int:
     """A -> 1, Z -> 26, AA -> 27."""
     idx = 0
@@ -677,10 +761,16 @@ def extract_metrics_with_gemini(
                 if str(col).strip().upper() in valid_cols
             }
             if clean:
-                normalized_rows.append({"row": row_num, "values": clean})
+                normalized_rows.append(
+                    {
+                        "row": row_num,
+                        "tag": _clean_text(row.get("tag")),
+                        "values": clean,
+                    }
+                )
                 batch_rows += 1
         logger.info(
-            "Batch %d/%d (rows %s-%s): %d rows returned",
+            "Batch %d/%d (rows %s-%s): %d items returned",
             index,
             len(batches),
             rows_batch[0]["row"],
@@ -693,7 +783,7 @@ def extract_metrics_with_gemini(
 
     filled = sum(1 for r in normalized_rows for v in r["values"].values() if v != "")
     logger.info(
-        "Extracted metrics for %s: %d rows, %d populated cells",
+        "Extracted metrics for %s: %d items, %d populated cells",
         month_header,
         len(normalized_rows),
         filled,
@@ -703,6 +793,175 @@ def extract_metrics_with_gemini(
         "month_abbr": month_abbr,
         "rows": normalized_rows,
     }
+
+
+def describe_total_sections(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """The sections behind the company totals, described well enough to find in the PDF."""
+    names = sorted(
+        {name for names in mapping["company_totals"].values() for name in names}
+    )
+    described: list[dict[str, Any]] = []
+    for name in names:
+        section = mapping["sections"].get(_norm_label(name))
+        if section is None:
+            logger.warning("Company total component %r is not a mapped section", name)
+            described.append({"section": name, "vertical": "", "detail_lines": []})
+            continue
+        described.append(
+            {
+                "section": name,
+                "vertical": section["vertical"],
+                "detail_lines": [f["pdf_tag"] for f in section["fields"]],
+            }
+        )
+    return described
+
+
+def extract_section_totals_with_gemini(
+    pdf_bytes: bytes,
+    template_columns: list[dict[str, str]],
+    sections: list[dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """Read each section's own TOTAL line, which the company totals are built from."""
+    _require_env("GEMINI_API_KEY", GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    context = json.dumps(
+        {"TEMPLATE_COLUMNS": template_columns, "SECTIONS": sections},
+        ensure_ascii=False,
+    )
+    data = _generate_json(
+        client,
+        pdf_bytes,
+        "Read the total line of each section listed below.\n\n" + context,
+        SECTION_TOTALS_SYSTEM_INSTRUCTION,
+        "section totals",
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError("section totals: expected a JSON object from Gemini")
+
+    valid_cols = {item["col"] for item in template_columns}
+    wanted = {_norm_label(s["section"]): s["section"] for s in sections}
+    totals: dict[str, dict[str, str]] = {}
+    for entry in data.get("section_totals") or []:
+        if not isinstance(entry, dict):
+            continue
+        key = _norm_label(entry.get("section"))
+        if key not in wanted:
+            continue
+        values = entry.get("values")
+        if not isinstance(values, dict):
+            continue
+        totals[key] = {
+            str(col).strip().upper(): ("" if val is None else str(val))
+            for col, val in values.items()
+            if str(col).strip().upper() in valid_cols
+        }
+
+    missing = [name for key, name in wanted.items() if key not in totals]
+    if missing:
+        logger.warning("No section total returned for: %s", ", ".join(missing))
+    logger.info("Read section totals for %d of %d sections", len(totals), len(sections))
+    return totals
+
+
+def _parse_number(value: str) -> float | None:
+    """Numbers as printed in the bulletin: 1,234.56 / -0.54 / (0.54)."""
+    text = _clean_text(value).replace(",", "").replace("\u2212", "-")
+    if not text or "%" in text:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return -number if negative else number
+
+
+def _sum_values(values: list[str]) -> str:
+    """
+    Add up values that are plain numbers.
+
+    Percentages cannot be added, so a column holding any of them stays empty
+    rather than showing an invented figure.
+    """
+    present = [v for v in values if _clean_text(v)]
+    if not present:
+        return ""
+    if any("%" in _clean_text(v) for v in present):
+        return ""
+    numbers = [_parse_number(v) for v in present]
+    if any(n is None for n in numbers):
+        return ""
+    return f"{sum(n for n in numbers if n is not None):.2f}"
+
+
+def combine_row_items(
+    items: list[dict[str, Any]], columns: list[str]
+) -> list[dict[str, Any]]:
+    """
+    Collapse the per-tag items into one value set per template row.
+
+    A row fed by a single PDF tag keeps its value verbatim. A row fed by several
+    (INTOPS MECH STDS = SSD+PAPER + SSD+PAPER-SG) gets their sum.
+    """
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for item in items:
+        grouped.setdefault(int(item["row"]), []).append(item)
+
+    combined: list[dict[str, Any]] = []
+    for row_num, row_items in sorted(grouped.items()):
+        if len(row_items) == 1:
+            combined.append({"row": row_num, "values": row_items[0]["values"]})
+            continue
+
+        tags = [item.get("tag") or "?" for item in row_items]
+        values = {
+            col: _sum_values([item["values"].get(col, "") for item in row_items])
+            for col in columns
+        }
+        logger.info("Row %d = sum of %s", row_num, " + ".join(tags))
+        combined.append({"row": row_num, "values": values})
+    return combined
+
+
+def company_total_rows(
+    mapping: dict[str, Any],
+    company_rows: dict[str, int],
+    section_totals: dict[str, dict[str, str]],
+    columns: list[str],
+) -> list[dict[str, Any]]:
+    """FMPL TOTAL / JV TOTAL, each the sum of the section totals listed in the mapping."""
+    rows: list[dict[str, Any]] = []
+    for label, components in mapping["company_totals"].items():
+        row_num = company_rows.get(label)
+        if row_num is None:
+            continue
+        keys = [_norm_label(name) for name in components]
+        missing = [
+            name for name, key in zip(components, keys) if key not in section_totals
+        ]
+        if missing:
+            logger.warning(
+                "%s is missing section totals for: %s", label, ", ".join(missing)
+            )
+        values = {
+            col: _sum_values(
+                [section_totals.get(key, {}).get(col, "") for key in keys]
+            )
+            for col in columns
+        }
+        populated = sum(1 for v in values.values() if v)
+        logger.info(
+            "%s (row %d) = %s -> %d values",
+            label,
+            row_num,
+            " + ".join(components),
+            populated,
+        )
+        rows.append({"row": row_num, "values": values})
+    return rows
 
 
 def _get_master_template_worksheet(spreadsheet: gspread.Spreadsheet) -> gspread.Worksheet:
@@ -904,9 +1163,186 @@ def _clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _update_month_headers(worksheet: gspread.Worksheet, month_header: str, month_abbr: str) -> None:
-    """Update APRIL'26-style section header and the four column titles."""
+def _norm_label(value: Any) -> str:
+    """Punctuation-free upper-case form, so labels match across the two files."""
+    text = _clean_text(value).upper()
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return text.strip()
+
+
+def load_field_mapping(path: str = "") -> dict[str, Any]:
+    """
+    Read ORDERS BULLETIN_data_mapping.xlsx.
+
+    Columns: Vertical | Vertical Supply | tags_from_the_order_bulletin_pdf | MAPPING.
+    Returns the PDF tag -> template field mapping per section, plus the component
+    sections behind the FMPL TOTAL / JV TOTAL company rows.
+    """
+    source = path or MAPPING_FILE
+    workbook = openpyxl.load_workbook(source, data_only=True, read_only=True)
+    sheet = workbook[MAPPING_SHEET] if MAPPING_SHEET else workbook.worksheets[0]
+
+    sections: dict[str, dict[str, Any]] = {}
+    company_totals: dict[str, list[str]] = {}
+    vertical = ""
+    supply = ""
+
+    for row in sheet.iter_rows(min_row=2, max_col=4, values_only=True):
+        cells = list(row) + [None] * (4 - len(row))
+        vertical = _clean_text(cells[0]) or vertical
+        supply = _clean_text(cells[1]) or supply
+        pdf_tag = _clean_text(cells[2])
+        target = _clean_text(cells[3])
+
+        if _norm_label(supply) in MAPPING_TOTAL_LABELS:
+            if target:
+                company_totals.setdefault(_norm_label(supply), []).append(target)
+            continue
+        if not pdf_tag or not target or _norm_label(pdf_tag) == "TOTAL":
+            continue
+
+        key = _norm_label(supply)
+        section = sections.setdefault(
+            key, {"vertical": vertical, "supply": supply, "fields": []}
+        )
+        section["fields"].append({"pdf_tag": pdf_tag, "target": target})
+
+    workbook.close()
+    if not sections:
+        raise RuntimeError(f"No field mappings found in {source!r}")
+
+    logger.info(
+        "Loaded mapping from %r: %d sections, %d fields, company totals for %s",
+        source,
+        len(sections),
+        sum(len(s["fields"]) for s in sections.values()),
+        ", ".join(sorted(company_totals)) or "nothing",
+    )
+    return {"sections": sections, "company_totals": company_totals}
+
+
+def _segment_candidates(vertical: str, supply: str) -> list[str]:
+    """
+    Mapping labels and template labels do not always agree.
+
+    "CORE DOMESTIC" is "CORE DOMESTIC FMPL" in the template, and a bare "JV"
+    only makes sense with its vertical attached ("CORE DOMESTIC JV").
+    """
+    return [
+        _norm_label(supply),
+        _norm_label(f"{vertical} {supply}"),
+        _norm_label(f"{supply} FMPL"),
+        _norm_label(f"{vertical} {supply} FMPL"),
+    ]
+
+
+def resolve_pdf_tag_rows(
+    template_rows: list[dict[str, Any]], mapping: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """
+    Turn the mapping into one work item per (template row, PDF tag).
+
+    A row fed by two PDF tags yields two items, which is what makes the INTOPS
+    MECH STDS sum possible. Rows the mapping says nothing about (section totals
+    and similar) keep their label-matching item with no tag.
+    """
+    by_segment: dict[str, list[dict[str, Any]]] = {}
+    for row in template_rows:
+        by_segment.setdefault(_norm_label(row["segment"]), []).append(row)
+
+    tagged: dict[int, list[dict[str, str]]] = {}
+    for key, section in mapping["sections"].items():
+        segment_rows: list[dict[str, Any]] = []
+        for candidate in _segment_candidates(section["vertical"], section["supply"]):
+            if candidate in by_segment:
+                segment_rows = by_segment[candidate]
+                break
+        if not segment_rows:
+            logger.warning(
+                "Mapping section %r (%s) matches no template segment",
+                section["supply"],
+                section["vertical"],
+            )
+            continue
+
+        by_division = {_norm_label(r["division"]): r for r in segment_rows}
+        for field in section["fields"]:
+            target = _norm_label(field["target"])
+            row = by_division.get(target)
+            if row is None and len(segment_rows) == 1 and not segment_rows[0]["division"]:
+                # Sections like "OPC - International" are a single unnamed row
+                row = segment_rows[0]
+            if row is None:
+                logger.warning(
+                    "Mapping %r -> %r has no row in template segment %r",
+                    field["pdf_tag"],
+                    field["target"],
+                    section["supply"],
+                )
+                continue
+            tagged.setdefault(row["row"], []).append(
+                {"pdf_section": section["supply"], "pdf_tag": field["pdf_tag"]}
+            )
+
+    company_rows: dict[str, int] = {}
+    for label in mapping["company_totals"]:
+        for row in template_rows:
+            if _norm_label(row["segment"]) == label:
+                company_rows[label] = row["row"]
+                break
+        if label not in company_rows:
+            logger.warning("Company total %r matches no template row", label)
+
+    items: list[dict[str, Any]] = []
+    for row in template_rows:
+        if row["row"] in company_rows.values():
+            continue  # filled by the FMPL/JV TOTAL aggregation instead
+        for tag in tagged.get(row["row"], [{}]):
+            items.append({**row, **tag})
+
+    logger.info(
+        "Mapped %d template rows to PDF tags (%d work items, %d company total rows)",
+        len(tagged),
+        len(items),
+        len(company_rows),
+    )
+    return items, company_rows
+
+
+def _update_month_headers(
+    worksheet: gspread.Worksheet,
+    month_header: str,
+    month_abbr: str,
+    now: datetime | None = None,
+) -> None:
+    """Update APRIL'26-style section header and every date-dependent column title."""
+    when = _now_ist(now)
+    prev = _previous_month(when)
+    # The fiscal year runs Apr-Mar, so these cover April up to last month. In
+    # January the previous month belongs to the year before, hence prev's own year.
+    prev_span = f"Apr - {prev.strftime('%b')}'{prev.strftime('%y')}"
+    growth_span = f"{when.year - 1} - {when.year}"
+    # The closed Apr-Mar year that the C-G block reports on, plus the year
+    # before it that its growth column compares against.
+    closed_end = _closed_fiscal_year_end(when)
+    closed_yy = f"{closed_end % 100:02d}"
+    closed_span = f"{closed_end - 1} - {closed_end}"
+    closed_growth_span = f"{closed_end - 2} - {closed_end - 1}"
+
     header_updates = [
+        {"range": TEMPLATE_PREV_FY_LABEL_CELL, "values": [[closed_span]]},
+        {
+            "range": f"{TEMPLATE_COL_PREV_FY_TOTAL_ACHMNT}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Total Achmnt \n Apr - Mar'{closed_yy}\n (incl. Digital Business)"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Achmnt\n  Apr-Mar'{closed_yy}\n  for Digital Sustenance"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_PREV_FY_GROWTH}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"% Growth over \n {closed_growth_span}\n (AVG)"]],
+        },
         {"range": TEMPLATE_MONTH_HEADER_CELL, "values": [[month_header]]},
         {
             "range": f"{TEMPLATE_COL_PROJ_INCL}{TEMPLATE_HEADER_ROW}",
@@ -924,13 +1360,37 @@ def _update_month_headers(worksheet: gspread.Worksheet, month_header: str, month
             "range": f"{TEMPLATE_COL_ACH_DIGI}{TEMPLATE_HEADER_ROW}",
             "values": [[f"Achmnt \n {month_abbr}\n  for Digital Sustenance"]],
         },
+        {
+            "range": f"{TEMPLATE_COL_FY_TOTAL_ACHMNT}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Total Achmnt \n {prev_span}\n (incl. Digital Business)"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_FY_DIGI_SUSTENANCE}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Achmnt\n {prev_span}\n  for Digital Sustenance"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_FY_GROWTH}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"% Growth over \n {growth_span}\n (AVG)"]],
+        },
     ]
     worksheet.batch_update(header_updates, value_input_option="RAW")
     logger.info(
-        "Updated template month header %s=%r and column titles for %r",
+        "Updated headers: %s=%r, month columns for %r, %s/%s = %r, %s = %r; "
+        "closed FY %r: %s/%s = 'Apr-Mar''%s', %s = %r",
         TEMPLATE_MONTH_HEADER_CELL,
         month_header,
         month_abbr,
+        TEMPLATE_COL_FY_TOTAL_ACHMNT,
+        TEMPLATE_COL_FY_DIGI_SUSTENANCE,
+        prev_span,
+        TEMPLATE_COL_FY_GROWTH,
+        growth_span,
+        closed_span,
+        TEMPLATE_COL_PREV_FY_TOTAL_ACHMNT,
+        TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE,
+        closed_yy,
+        TEMPLATE_COL_PREV_FY_GROWTH,
+        closed_growth_span,
     )
 
 
@@ -1046,7 +1506,20 @@ def update_formatted_template(pdf_bytes: bytes) -> dict[str, Any] | None:
             f"(cols={len(template_columns)}, rows={len(template_rows)})"
         )
 
-    metrics = extract_metrics_with_gemini(pdf_bytes, template_columns, template_rows)
+    column_letters = [c["col"] for c in template_columns]
+    mapping = load_field_mapping()
+    work_items, company_rows = resolve_pdf_tag_rows(template_rows, mapping)
+
+    metrics = extract_metrics_with_gemini(pdf_bytes, template_columns, work_items)
+    metrics["rows"] = combine_row_items(metrics["rows"], column_letters)
+
+    if company_rows:
+        section_totals = extract_section_totals_with_gemini(
+            pdf_bytes, template_columns, describe_total_sections(mapping)
+        )
+        metrics["rows"].extend(
+            company_total_rows(mapping, company_rows, section_totals, column_letters)
+        )
 
     tab_name = day_tab_name(when.date())
     worksheet = _get_or_create_dated_template_tab(spreadsheet, master_ws, tab_name)

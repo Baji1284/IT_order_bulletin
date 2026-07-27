@@ -190,6 +190,17 @@ gcloud run jobs create "$JOB_NAME" \
 
 **Console:** Cloud Run → Jobs → Create → select image → Variables & Secrets → map secrets to env vars as above.
 
+### Field mapping
+
+`ORDERS BULLETIN_data_mapping.xlsx` decides which PDF line feeds which template field, using
+its `tags_from_the_order_bulletin_pdf` and `MAPPING` columns. It is copied into the image, so
+**editing the mapping means rebuilding and redeploying** — there is no runtime lookup. Its last
+block also defines the company totals: `FMPL TOTAL` and `JV TOTAL` are summed from the section
+totals listed there. Two rules are computed in Python rather than by the model: the INTOPS FMPL
+`MECH STDS` field is `SSD+PAPER` plus `SSD+PAPER-SG`, and the company totals are sums of section
+totals. Percentage columns are left blank in those computed rows, because percentages cannot be
+meaningfully added.
+
 ### Drive location for the monthly files
 
 `DRIVE_PARENT_FOLDER_ID` must point at a **Shared Drive** (or a folder inside one), and the

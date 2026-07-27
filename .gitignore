@@ -10,4 +10,6 @@ venv/
 .idea/
 .vscode/
 *.xlsx
-_inspect_template.py
+# The field mapping ships in the image, so it has to be tracked and uploadable
+!ORDERS BULLETIN_data_mapping.xlsx
+_inspect_*.py
