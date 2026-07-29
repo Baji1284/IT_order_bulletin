@@ -219,6 +219,22 @@ copying the template there fails with `storageQuotaExceeded`. The only alternati
 `DRIVE_IMPERSONATE_USER` and grant the service account domain-wide delegation for
 `https://www.googleapis.com/auth/drive`, so files are created under that user's quota instead.
 
+### Deploy from GitHub (Cloud Build trigger)
+
+Trigger `order-bulletin` watches `Baji1284/IT_order_bulletin` branch `main` and runs as
+`fm-orders-cloudbuild@hr-docker.iam.gserviceaccount.com`.
+
+1. Keep `cloudbuild.yaml` in the repo root (builds the image, pushes to Artifact Registry,
+   updates Cloud Run Job `fm-orders-bulletin`).
+2. Push to `main` — the trigger runs automatically.
+3. Check: Cloud Build → History, then confirm the job image updated.
+
+Manual run of the same config:
+
+```bash
+gcloud builds triggers run order-bulletin --region=asia-south1 --branch=main --project=hr-docker
+```
+
 ### Manual test run
 
 ```bash
