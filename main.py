@@ -84,6 +84,7 @@ TEMPLATE_COL_PREV_FY_TOTAL_ACHMNT = os.environ.get(
 TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE = os.environ.get(
     "TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE", "D"
 ).strip()
+TEMPLATE_COL_PREV_FY_AVG = os.environ.get("TEMPLATE_COL_PREV_FY_AVG", "E").strip()
 TEMPLATE_COL_PREV_FY_GROWTH = os.environ.get("TEMPLATE_COL_PREV_FY_GROWTH", "F").strip()
 # Current fiscal-year block headers that name the months covered so far
 TEMPLATE_COL_FY_TOTAL_ACHMNT = os.environ.get("TEMPLATE_COL_FY_TOTAL_ACHMNT", "R").strip()
@@ -98,6 +99,22 @@ MAPPING_FILE = os.environ.get(
 ).strip()
 MAPPING_SHEET = os.environ.get("MAPPING_SHEET", "").strip()
 MAPPING_TOTAL_LABELS = {"FMPL TOTAL", "JV TOTAL"}
+
+# Extra PDF totals used by derived template rows (not in the mapping workbook)
+EXTRA_PDF_TOTAL_SECTIONS = [
+    {
+        "section": "Grand Total",
+        "vertical": "Grand Total",
+        "detail_lines": [],
+    },
+    {
+        "section": "INTERCO-JV",
+        "vertical": "INTERCO",
+        "detail_lines": [],
+    },
+]
+CORE_MECH_SUM_DIVISIONS = ("MECH STDS", "BOILERS", "ENERGY SERVICES")
+CORE_MECH_SUM_TARGET = "MECH STDS + BOILERS + ENERGY SERVICES"
 
 # One spreadsheet file per month, holding a dated tab for each day of that month
 DRIVE_PARENT_FOLDER_ID = os.environ.get("DRIVE_PARENT_FOLDER_ID", "").strip()
@@ -225,6 +242,10 @@ You receive:
 Your task: for each section, find its total line in the PDF (e.g. "PROCESS DOMESTIC TOTAL
 ( FMPL) :", "INTOPS - FMPL TOTAL :", "OPC DOMESTIC TOTAL") and return that line's value for
 every template column.
+
+Special sections:
+- "Grand Total": the bulletin's overall Grand Total / GROUP TOTAL line (excludes INTERCO-JV).
+- "INTERCO-JV": the Total line of the INTERCO-JV market segment.
 
 Return ONLY a JSON object with this exact shape:
 {
@@ -796,7 +817,7 @@ def extract_metrics_with_gemini(
 
 
 def describe_total_sections(mapping: dict[str, Any]) -> list[dict[str, Any]]:
-    """The sections behind the company totals, described well enough to find in the PDF."""
+    """The sections behind the company totals, plus Grand Total / INTERCO-JV."""
     names = sorted(
         {name for names in mapping["company_totals"].values() for name in names}
     )
@@ -814,6 +835,7 @@ def describe_total_sections(mapping: dict[str, Any]) -> list[dict[str, Any]]:
                 "detail_lines": [f["pdf_tag"] for f in section["fields"]],
             }
         )
+    described.extend(EXTRA_PDF_TOTAL_SECTIONS)
     return described
 
 
@@ -962,6 +984,253 @@ def company_total_rows(
         )
         rows.append({"row": row_num, "values": values})
     return rows
+
+
+def _divide_value(value: str, divisor: float) -> str:
+    """Divide a bulletin number; leave blanks / percentages alone."""
+    number = _parse_number(value)
+    if number is None or divisor == 0:
+        return ""
+    return f"{number / divisor:.2f}"
+
+
+def _metric_value_map(rows: list[dict[str, Any]]) -> dict[int, dict[str, str]]:
+    return {int(row["row"]): dict(row.get("values") or {}) for row in rows}
+
+
+def _metric_rows_from_map(value_map: dict[int, dict[str, str]]) -> list[dict[str, Any]]:
+    return [{"row": row, "values": values} for row, values in sorted(value_map.items())]
+
+
+def _segment_key(row: dict[str, Any]) -> str:
+    return _norm_label(row.get("segment"))
+
+
+def _division_key(row: dict[str, Any]) -> str:
+    return _norm_label(row.get("division"))
+
+
+def _find_template_row(
+    template_rows: list[dict[str, Any]],
+    *,
+    segment_pred,
+    division_pred=None,
+    after_row: int = 0,
+) -> dict[str, Any] | None:
+    for row in template_rows:
+        if row["row"] <= after_row:
+            continue
+        if not segment_pred(_segment_key(row)):
+            continue
+        if division_pred is not None and not division_pred(_division_key(row)):
+            continue
+        return row
+    return None
+
+
+def _is_process_domestic_fmpl_total(segment: str) -> bool:
+    return segment == "PROCESS DOMESTIC TOTAL FMPL"
+
+
+def _is_core_domestic_fmpl_total(segment: str) -> bool:
+    return "CORE DOMESTIC FMPL TOTAL" in segment
+
+
+def _is_digital_sustenance(segment: str) -> bool:
+    return segment == "DIGITAL SUSTENANCE BUSINESS"
+
+
+def _is_core_domestic_fmpl_segment(segment: str) -> bool:
+    return segment == "CORE DOMESTIC FMPL"
+
+
+def _apply_digital_sustenance_from_total(
+    value_map: dict[int, dict[str, str]],
+    *,
+    source_row: int,
+    target_row: int,
+    label: str,
+) -> None:
+    """
+    DIGITAL SUSTENANCE BUSINESS cells derived from the section TOTAL row:
+      D  = TOTAL[D] as-is
+      E  = TOTAL[D] / 12   (Achmnt AVG)
+      S  = TOTAL[S] as-is  (current FY digital sustenance)
+      Y  = TOTAL[Y] as-is  (current-month projections for digital sustenance)
+      AA = TOTAL[AA] as-is (current-month achmnt for digital sustenance)
+    """
+    source = value_map.get(source_row) or {}
+    digi = source.get(TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE, "")
+    updates = {
+        TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE: digi,
+        TEMPLATE_COL_PREV_FY_AVG: _divide_value(digi, 12),
+        TEMPLATE_COL_FY_DIGI_SUSTENANCE: source.get(
+            TEMPLATE_COL_FY_DIGI_SUSTENANCE, ""
+        ),
+        TEMPLATE_COL_PROJ_DIGI: source.get(TEMPLATE_COL_PROJ_DIGI, ""),
+        TEMPLATE_COL_ACH_DIGI: source.get(TEMPLATE_COL_ACH_DIGI, ""),
+    }
+    target = value_map.setdefault(target_row, {})
+    target.update({col: val for col, val in updates.items() if val != ""})
+    logger.info(
+        "%s DIGITAL SUSTENANCE (row %d) <- TOTAL row %d: D=%r E=%r S=%r Y=%r AA=%r",
+        label,
+        target_row,
+        source_row,
+        updates[TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE],
+        updates[TEMPLATE_COL_PREV_FY_AVG],
+        updates[TEMPLATE_COL_FY_DIGI_SUSTENANCE],
+        updates[TEMPLATE_COL_PROJ_DIGI],
+        updates[TEMPLATE_COL_ACH_DIGI],
+    )
+
+
+def apply_derived_template_rows(
+    template_rows: list[dict[str, Any]],
+    metric_rows: list[dict[str, Any]],
+    section_totals: dict[str, dict[str, str]],
+    columns: list[str],
+) -> list[dict[str, Any]]:
+    """
+    Post-Gemini / post Rule A+B calculations that the mapping sheet does not cover:
+
+    - Process / CORE DIGITAL SUSTENANCE BUSINESS from the matching FMPL TOTAL
+    - CORE MECH STDS + BOILERS + ENERGY SERVICES sum
+    - GROUP TOTAL (including JV Interco) = Grand Total + INTERCO-JV Total
+    """
+    value_map = _metric_value_map(metric_rows)
+
+    process_total = _find_template_row(
+        template_rows, segment_pred=_is_process_domestic_fmpl_total
+    )
+    if process_total:
+        digi = _find_template_row(
+            template_rows,
+            segment_pred=_is_digital_sustenance,
+            after_row=process_total["row"],
+        )
+        if digi:
+            _apply_digital_sustenance_from_total(
+                value_map,
+                source_row=process_total["row"],
+                target_row=digi["row"],
+                label="Process Domestic FMPL",
+            )
+        else:
+            logger.warning(
+                "No DIGITAL SUSTENANCE BUSINESS row after Process Domestic FMPL TOTAL"
+            )
+    else:
+        logger.warning("PROCESS DOMESTIC TOTAL (FMPL) row not found in template")
+
+    core_total = _find_template_row(
+        template_rows, segment_pred=_is_core_domestic_fmpl_total
+    )
+    if core_total:
+        digi = _find_template_row(
+            template_rows,
+            segment_pred=_is_digital_sustenance,
+            after_row=core_total["row"],
+        )
+        if digi:
+            _apply_digital_sustenance_from_total(
+                value_map,
+                source_row=core_total["row"],
+                target_row=digi["row"],
+                label="CORE DOMESTIC FMPL",
+            )
+        else:
+            logger.warning(
+                "No DIGITAL SUSTENANCE BUSINESS row after CORE DOMESTIC FMPL TOTAL"
+            )
+    else:
+        logger.warning("CORE DOMESTIC FMPL TOTAL row not found in template")
+
+    # CORE: Mech Stds + Boilers + Energy Services -> combined division row
+    wanted = {_norm_label(name) for name in CORE_MECH_SUM_DIVISIONS}
+    source_parts: dict[str, int] = {}
+    target_row_num: int | None = None
+    for row in template_rows:
+        if not _is_core_domestic_fmpl_segment(_segment_key(row)):
+            continue
+        div = _division_key(row)
+        if div == _norm_label(CORE_MECH_SUM_TARGET):
+            target_row_num = row["row"]
+        elif div in wanted:
+            source_parts[div] = row["row"]
+
+    if target_row_num is None:
+        logger.warning("CORE row %r not found in template", CORE_MECH_SUM_TARGET)
+    elif len(source_parts) < len(wanted):
+        missing = sorted(wanted - set(source_parts))
+        logger.warning(
+            "CORE mech sum is missing division rows: %s", ", ".join(missing)
+        )
+    else:
+        values = {
+            col: _sum_values(
+                [
+                    (value_map.get(source_parts[div]) or {}).get(col, "")
+                    for div in sorted(source_parts)
+                ]
+            )
+            for col in columns
+        }
+        value_map[target_row_num] = values
+        logger.info(
+            "CORE %s (row %d) = %s -> %d values",
+            CORE_MECH_SUM_TARGET,
+            target_row_num,
+            " + ".join(CORE_MECH_SUM_DIVISIONS),
+            sum(1 for v in values.values() if v),
+        )
+
+    # GROUP TOTAL WITHOUT INTERCO <- Grand Total; WITH INTERCO <- that + INTERCO-JV
+    without_row = _find_template_row(
+        template_rows,
+        segment_pred=lambda s: s == "GROUP TOTAL WITHOUT INTERCO",
+    )
+    with_row = _find_template_row(
+        template_rows,
+        segment_pred=lambda s: s.startswith("GROUP TOTAL") and "INCLUDING JV INTERCO" in s,
+    )
+    grand = section_totals.get(_norm_label("Grand Total")) or {}
+    interco = section_totals.get(_norm_label("INTERCO-JV")) or {}
+
+    if without_row and grand:
+        merged = dict(value_map.get(without_row["row"]) or {})
+        merged.update({col: val for col, val in grand.items() if val != ""})
+        value_map[without_row["row"]] = merged
+        logger.info(
+            "GROUP TOTAL WITHOUT INTERCO (row %d) <- Grand Total (%d values)",
+            without_row["row"],
+            sum(1 for v in merged.values() if v),
+        )
+    elif without_row is None:
+        logger.warning("GROUP TOTAL WITHOUT INTERCO row not found in template")
+    else:
+        logger.warning("Grand Total was not returned by Gemini")
+
+    if with_row is None:
+        logger.warning("GROUP TOTAL (including JV Interco) row not found in template")
+    elif without_row is None:
+        logger.warning("Cannot build GROUP TOTAL with Interco without the WITHOUT INTERCO row")
+    else:
+        left = value_map.get(without_row["row"]) or {}
+        values = {
+            col: _sum_values([left.get(col, ""), interco.get(col, "")])
+            for col in columns
+        }
+        value_map[with_row["row"]] = values
+        if not interco:
+            logger.warning("INTERCO-JV total was not returned by Gemini")
+        logger.info(
+            "GROUP TOTAL (including JV Interco) (row %d) = WITHOUT INTERCO + INTERCO-JV -> %d values",
+            with_row["row"],
+            sum(1 for v in values.values() if v),
+        )
+
+    return _metric_rows_from_map(value_map)
 
 
 def _get_master_template_worksheet(spreadsheet: gspread.Spreadsheet) -> gspread.Worksheet:
@@ -1513,13 +1782,16 @@ def update_formatted_template(pdf_bytes: bytes) -> dict[str, Any] | None:
     metrics = extract_metrics_with_gemini(pdf_bytes, template_columns, work_items)
     metrics["rows"] = combine_row_items(metrics["rows"], column_letters)
 
+    section_totals = extract_section_totals_with_gemini(
+        pdf_bytes, template_columns, describe_total_sections(mapping)
+    )
     if company_rows:
-        section_totals = extract_section_totals_with_gemini(
-            pdf_bytes, template_columns, describe_total_sections(mapping)
-        )
         metrics["rows"].extend(
             company_total_rows(mapping, company_rows, section_totals, column_letters)
         )
+    metrics["rows"] = apply_derived_template_rows(
+        template_rows, metrics["rows"], section_totals, column_letters
+    )
 
     tab_name = day_tab_name(when.date())
     worksheet = _get_or_create_dated_template_tab(spreadsheet, master_ws, tab_name)

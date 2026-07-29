@@ -196,9 +196,18 @@ gcloud run jobs create "$JOB_NAME" \
 its `tags_from_the_order_bulletin_pdf` and `MAPPING` columns. It is copied into the image, so
 **editing the mapping means rebuilding and redeploying** — there is no runtime lookup. Its last
 block also defines the company totals: `FMPL TOTAL` and `JV TOTAL` are summed from the section
-totals listed there. Two rules are computed in Python rather than by the model: the INTOPS FMPL
-`MECH STDS` field is `SSD+PAPER` plus `SSD+PAPER-SG`, and the company totals are sums of section
-totals. Percentage columns are left blank in those computed rows, because percentages cannot be
+totals listed there. Extra rules are computed in Python rather than by the model:
+
+- INTOPS FMPL `MECH STDS` = `SSD+PAPER` + `SSD+PAPER-SG`
+- Company totals = sums of the mapped section totals
+- Process Domestic / CORE DOMESTIC `DIGITAL SUSTENANCE BUSINESS` copies the matching FMPL
+  TOTAL's digital-sustenance cells (`D` as-is, `E` = `D`/12, current-FY `S`, and
+  current-month projections `Y` + achmnt `AA`)
+- CORE `MECH STDS + BOILERS + ENERGY SERVICES` = sum of those three division rows
+- `GROUP TOTAL WITHOUT INTERCO` = PDF Grand Total; `GROUP TOTAL (including JV Interco)` =
+  Grand Total + `INTERCO-JV` Total
+
+Percentage columns are left blank in those computed rows, because percentages cannot be
 meaningfully added.
 
 ### Drive location for the monthly files
