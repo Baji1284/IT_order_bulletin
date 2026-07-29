@@ -130,9 +130,10 @@ MONTHLY_FILE_SHARE_EMAILS = [
 # Who gets the "today's bulletin is ready" mail with the link to the monthly file
 NOTIFY_EMAILS = [
     email.strip()
-    for email in os.environ.get(
-        "NOTIFY_EMAILS", "bssali@forbesmarshall.com"
-    ).split(",")
+    for email in re.split(
+        r"[,\s]+",
+        os.environ.get("NOTIFY_EMAILS", "bssali@forbesmarshall.com"),
+    )
     if email.strip()
 ]
 NOTIFY_FROM_EMAIL = os.environ.get("NOTIFY_FROM_EMAIL", GMAIL_USER_EMAIL).strip()
