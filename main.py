@@ -245,7 +245,8 @@ Your task: for each section, find its total line in the PDF (e.g. "PROCESS DOMES
 every template column.
 
 Special sections:
-- "Grand Total": the bulletin's overall Grand Total / GROUP TOTAL line (excludes INTERCO-JV).
+- "Grand Total": the bulletin's overall Grand Total / GROUP TOTAL line (this is the
+  figure that includes INTERCO-JV when present).
 - "INTERCO-JV": the Total line of the INTERCO-JV market segment.
 
 Return ONLY a JSON object with this exact shape:
@@ -920,6 +921,23 @@ def _sum_values(values: list[str]) -> str:
     return f"{sum(n for n in numbers if n is not None):.2f}"
 
 
+def _subtract_values(left: str, right: str) -> str:
+    """left - right for plain bulletin numbers; blank if either side is unusable."""
+    if not _clean_text(left):
+        return ""
+    if "%" in _clean_text(left) or ("%" in _clean_text(right) if right else False):
+        return ""
+    left_n = _parse_number(left)
+    if left_n is None:
+        return ""
+    if not _clean_text(right):
+        return f"{left_n:.2f}"
+    right_n = _parse_number(right)
+    if right_n is None:
+        return ""
+    return f"{left_n - right_n:.2f}"
+
+
 def combine_row_items(
     items: list[dict[str, Any]], columns: list[str]
 ) -> list[dict[str, Any]]:
@@ -1097,7 +1115,8 @@ def apply_derived_template_rows(
 
     - Process / CORE DIGITAL SUSTENANCE BUSINESS from the matching FMPL TOTAL
     - CORE MECH STDS + BOILERS + ENERGY SERVICES sum
-    - GROUP TOTAL (including JV Interco) = Grand Total + INTERCO-JV Total
+    - GROUP TOTAL WITHOUT INTERCO = Grand Total - INTERCO-JV Total
+    - GROUP TOTAL (including JV Interco) = Grand Total as printed
     """
     value_map = _metric_value_map(metric_rows)
 
@@ -1186,7 +1205,8 @@ def apply_derived_template_rows(
             sum(1 for v in values.values() if v),
         )
 
-    # GROUP TOTAL WITHOUT INTERCO <- Grand Total; WITH INTERCO <- that + INTERCO-JV
+    # GROUP TOTAL INCLUDING <- Grand Total as-is;
+    # WITHOUT INTERCO <- Grand Total - INTERCO-JV
     without_row = _find_template_row(
         template_rows,
         segment_pred=lambda s: s == "GROUP TOTAL WITHOUT INTERCO",
@@ -1198,36 +1218,39 @@ def apply_derived_template_rows(
     grand = section_totals.get(_norm_label("Grand Total")) or {}
     interco = section_totals.get(_norm_label("INTERCO-JV")) or {}
 
-    if without_row and grand:
-        merged = dict(value_map.get(without_row["row"]) or {})
-        merged.update({col: val for col, val in grand.items() if val != ""})
-        value_map[without_row["row"]] = merged
-        logger.info(
-            "GROUP TOTAL WITHOUT INTERCO (row %d) <- Grand Total (%d values)",
-            without_row["row"],
-            sum(1 for v in merged.values() if v),
-        )
-    elif without_row is None:
-        logger.warning("GROUP TOTAL WITHOUT INTERCO row not found in template")
-    else:
+    if not grand:
         logger.warning("Grand Total was not returned by Gemini")
 
-    if with_row is None:
+    if with_row and grand:
+        merged = dict(value_map.get(with_row["row"]) or {})
+        merged.update({col: val for col, val in grand.items() if val != ""})
+        value_map[with_row["row"]] = merged
+        logger.info(
+            "GROUP TOTAL (including JV Interco) (row %d) <- Grand Total (%d values)",
+            with_row["row"],
+            sum(1 for v in merged.values() if v),
+        )
+    elif with_row is None:
         logger.warning("GROUP TOTAL (including JV Interco) row not found in template")
-    elif without_row is None:
-        logger.warning("Cannot build GROUP TOTAL with Interco without the WITHOUT INTERCO row")
+
+    if without_row is None:
+        logger.warning("GROUP TOTAL WITHOUT INTERCO row not found in template")
+    elif not grand:
+        pass  # already logged
     else:
-        left = value_map.get(without_row["row"]) or {}
+        if not interco:
+            logger.warning(
+                "INTERCO-JV total was not returned by Gemini; "
+                "WITHOUT INTERCO will equal Grand Total where Interco is blank"
+            )
         values = {
-            col: _sum_values([left.get(col, ""), interco.get(col, "")])
+            col: _subtract_values(grand.get(col, ""), interco.get(col, ""))
             for col in columns
         }
-        value_map[with_row["row"]] = values
-        if not interco:
-            logger.warning("INTERCO-JV total was not returned by Gemini")
+        value_map[without_row["row"]] = values
         logger.info(
-            "GROUP TOTAL (including JV Interco) (row %d) = WITHOUT INTERCO + INTERCO-JV -> %d values",
-            with_row["row"],
+            "GROUP TOTAL WITHOUT INTERCO (row %d) = Grand Total - INTERCO-JV -> %d values",
+            without_row["row"],
             sum(1 for v in values.values() if v),
         )
 

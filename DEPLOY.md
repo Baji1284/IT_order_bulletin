@@ -204,8 +204,8 @@ totals listed there. Extra rules are computed in Python rather than by the model
   TOTAL's digital-sustenance cells (`D` as-is, `E` = `D`/12, current-FY `S`, and
   current-month projections `Y` + achmnt `AA`)
 - CORE `MECH STDS + BOILERS + ENERGY SERVICES` = sum of those three division rows
-- `GROUP TOTAL WITHOUT INTERCO` = PDF Grand Total; `GROUP TOTAL (including JV Interco)` =
-  Grand Total + `INTERCO-JV` Total
+- `GROUP TOTAL (including JV Interco)` = PDF Grand Total as-is;
+  `GROUP TOTAL WITHOUT INTERCO` = Grand Total − `INTERCO-JV` Total
 
 Percentage columns are left blank in those computed rows, because percentages cannot be
 meaningfully added.
