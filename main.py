@@ -1302,26 +1302,47 @@ def _service_account_email() -> str:
 
 
 def _find_spreadsheet_by_name(drive, name: str) -> str | None:
-    clauses = [
-        f"name = '{name.replace(chr(39), chr(92) + chr(39))}'",
-        f"mimeType = '{SPREADSHEET_MIME}'",
-        "trashed = false",
-    ]
-    if DRIVE_PARENT_FOLDER_ID:
-        clauses.append(f"'{DRIVE_PARENT_FOLDER_ID}' in parents")
-    response = (
-        drive.files()
-        .list(
-            q=" and ".join(clauses),
-            fields="files(id,name)",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
+    """Locate a spreadsheet by exact name, including Shared Drive files."""
+    safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
+
+    def _search(with_parent: bool) -> str | None:
+        clauses = [
+            f"name = '{safe_name}'",
+            f"mimeType = '{SPREADSHEET_MIME}'",
+            "trashed = false",
+        ]
+        if with_parent and DRIVE_PARENT_FOLDER_ID:
+            clauses.append(f"'{DRIVE_PARENT_FOLDER_ID}' in parents")
+        response = (
+            drive.files()
+            .list(
+                q=" and ".join(clauses),
+                fields="files(id,name,parents)",
+                pageSize=10,
+                # Default corpora=user misses Shared Drive files even with
+                # includeItemsFromAllDrives; allDrives is required here.
+                corpora="allDrives",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
         )
-        .execute()
-    )
-    files = response.get("files") or []
-    return files[0]["id"] if files else None
+        files = response.get("files") or []
+        return files[0]["id"] if files else None
+
+    found = _search(with_parent=True)
+    if found:
+        return found
+    if DRIVE_PARENT_FOLDER_ID:
+        logger.warning(
+            "Monthly file %r not found under folder %s; searching all drives",
+            name,
+            DRIVE_PARENT_FOLDER_ID,
+        )
+        found = _search(with_parent=False)
+        if found:
+            logger.info("Found monthly file %r outside the configured folder (%s)", name, found)
+    return found
 
 
 def _prune_to_master_tab(spreadsheet: gspread.Spreadsheet) -> None:
@@ -1363,6 +1384,13 @@ def get_or_create_monthly_spreadsheet(
                 "Drive storage. Set DRIVE_IMPERSONATE_USER (needs the Drive scope added "
                 "to domain-wide delegation), use a Shared Drive folder, or pre-create the "
                 "file by copying the template and naming it exactly as above."
+            ) from exc
+        if getattr(exc, "resp", None) is not None and exc.resp.status in (403, 404):
+            raise RuntimeError(
+                f"Cannot copy template {TEMPLATE_SHEET_ID!r} to create {file_name!r}: "
+                f"{exc}. Share that template spreadsheet with "
+                f"{_service_account_email() or 'the runtime service account'} as Editor "
+                "(and keep it in a Shared Drive the SA can access)."
             ) from exc
         raise
 
