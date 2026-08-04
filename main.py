@@ -1925,16 +1925,22 @@ def run() -> None:
     gmail = get_gmail_service(gmail_creds)
     message_id = find_latest_message_id(gmail, EMAIL_SUBJECT)
     pdf_bytes = download_pdf_attachment(gmail, message_id)
-    rows = extract_table_with_gemini(pdf_bytes)
-    write_to_sheet(rows)
-    result = update_formatted_template(pdf_bytes)
-    if result:
-        # The sheet is already written, so a mail failure must not trigger a
-        # full retry of the (slow, paid) Gemini extraction.
-        try:
-            send_bulletin_link_email(result)
-        except Exception:
-            logger.exception("Could not send the bulletin link mail")
+
+    # Production path: dated tabs inside the monthly Shared Drive file.
+    # The legacy raw dump to GOOGLE_SHEET_ID is only used when no template is
+    # configured — and must never abort the formatted write (a 403 on that
+    # old sheet was failing the whole daily job after Gemini had already run).
+    if TEMPLATE_SHEET_ID:
+        result = update_formatted_template(pdf_bytes)
+        if result:
+            try:
+                send_bulletin_link_email(result)
+            except Exception:
+                logger.exception("Could not send the bulletin link mail")
+    else:
+        rows = extract_table_with_gemini(pdf_bytes)
+        write_to_sheet(rows)
+
     logger.info("Job completed successfully")
 
 
