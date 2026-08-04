@@ -118,6 +118,9 @@ CORE_MECH_SUM_TARGET = "MECH STDS + BOILERS + ENERGY SERVICES"
 
 # One spreadsheet file per month, holding a dated tab for each day of that month
 DRIVE_PARENT_FOLDER_ID = os.environ.get("DRIVE_PARENT_FOLDER_ID", "").strip()
+# Optional: open this spreadsheet directly (skips name search / template copy).
+# Useful when the monthly file already exists but Drive search cannot see it.
+MONTHLY_SPREADSHEET_ID = os.environ.get("MONTHLY_SPREADSHEET_ID", "").strip()
 # Service accounts own no Drive storage, so new files must be owned by a real user
 # (domain-wide delegation) or live in a Shared Drive.
 DRIVE_IMPERSONATE_USER = os.environ.get("DRIVE_IMPERSONATE_USER", "").strip()
@@ -1358,6 +1361,14 @@ def get_or_create_monthly_spreadsheet(
     drive, gc: gspread.Client, file_name: str
 ) -> gspread.Spreadsheet:
     """One spreadsheet file per month, copied from the master template file."""
+    if MONTHLY_SPREADSHEET_ID:
+        logger.info(
+            "Opening monthly file via MONTHLY_SPREADSHEET_ID=%s (requested name %r)",
+            MONTHLY_SPREADSHEET_ID,
+            file_name,
+        )
+        return gc.open_by_key(MONTHLY_SPREADSHEET_ID)
+
     existing_id = _find_spreadsheet_by_name(drive, file_name)
     if existing_id:
         logger.info("Reusing monthly file %r (%s)", file_name, existing_id)
