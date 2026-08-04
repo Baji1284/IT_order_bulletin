@@ -141,6 +141,10 @@ NOTIFY_EMAILS = [
 ]
 NOTIFY_FROM_EMAIL = os.environ.get("NOTIFY_FROM_EMAIL", GMAIL_USER_EMAIL).strip()
 
+# Optional backfill: YYYY-MM-DD in IST. When set, fetch that day's bulletin email
+# and write the matching dated tab (skips notification mail).
+RUN_DATE = os.environ.get("RUN_DATE", "").strip()
+
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 GMAIL_SEND_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 SHEETS_SCOPES = [
@@ -325,28 +329,56 @@ def get_gmail_service(creds: service_account.Credentials):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
-def find_latest_message_id(gmail, subject: str) -> str:
-    query = f'subject:"{subject}" has:attachment filename:pdf newer_than:2d'
-    logger.info("Searching Gmail: %s", query)
-    result = (
-        gmail.users()
-        .messages()
-        .list(userId="me", q=query, maxResults=5)
-        .execute()
-    )
-    messages = result.get("messages") or []
-    if not messages:
-        query = f'subject:"{subject}" newer_than:2d'
+def find_latest_message_id(gmail, subject: str, on_day: date | None = None) -> str:
+    """
+    Find the FM Orders Bulletin email.
+
+    When on_day is set (backfill), search that calendar day in the mailbox.
+    Otherwise use the most recent message from the last 2 days.
+    """
+    if on_day is not None:
+        # Gmail after/before are date boundaries; cover the full on_day.
+        day_after = on_day + timedelta(days=1)
+        day_before = on_day - timedelta(days=1)
+        queries = [
+            (
+                f'subject:"{subject}" has:attachment filename:pdf '
+                f'after:{day_before.strftime("%Y/%m/%d")} '
+                f'before:{day_after.strftime("%Y/%m/%d")}'
+            ),
+            (
+                f'subject:"{subject}" '
+                f'after:{day_before.strftime("%Y/%m/%d")} '
+                f'before:{day_after.strftime("%Y/%m/%d")}'
+            ),
+        ]
+    else:
+        queries = [
+            f'subject:"{subject}" has:attachment filename:pdf newer_than:2d',
+            f'subject:"{subject}" newer_than:2d',
+        ]
+
+    messages: list[dict[str, Any]] = []
+    used_query = ""
+    for query in queries:
+        logger.info("Searching Gmail: %s", query)
         result = (
             gmail.users()
             .messages()
-            .list(userId="me", q=query, maxResults=5)
+            .list(userId="me", q=query, maxResults=10)
             .execute()
         )
         messages = result.get("messages") or []
+        used_query = query
+        if messages:
+            break
 
     if not messages:
-        raise RuntimeError(f'No recent email found with subject "{subject}"')
+        target = on_day.isoformat() if on_day else "the last 2 days"
+        raise RuntimeError(
+            f'No email found with subject "{subject}" for {target} '
+            f"(last query: {used_query})"
+        )
 
     msg_id = messages[0]["id"]
     logger.info("Using message id=%s", msg_id)
@@ -503,6 +535,24 @@ def _now_ist(now: datetime | None = None) -> datetime:
     if when.tzinfo is None:
         return when.replace(tzinfo=IST)
     return when.astimezone(IST)
+
+
+def _parse_run_date() -> datetime | None:
+    """Parse RUN_DATE=YYYY-MM-DD into an IST datetime at noon that day."""
+    if not RUN_DATE:
+        return None
+    try:
+        day = date.fromisoformat(RUN_DATE)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"RUN_DATE must be YYYY-MM-DD, got {RUN_DATE!r}"
+        ) from exc
+    return datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=IST)
+
+
+def run_moment() -> datetime:
+    """Effective 'today' for this execution (backfill date or current IST now)."""
+    return _parse_run_date() or _now_ist()
 
 
 def current_month_tab_name(now: datetime | None = None) -> str:
@@ -1813,7 +1863,9 @@ def _write_metric_values(
     return len(updates), populated
 
 
-def update_formatted_template(pdf_bytes: bytes) -> dict[str, Any] | None:
+def update_formatted_template(
+    pdf_bytes: bytes, when: datetime | None = None
+) -> dict[str, Any] | None:
     """Fill a date-named tab inside this month's own spreadsheet file."""
     if not TEMPLATE_SHEET_ID:
         logger.warning("TEMPLATE_SHEET_ID not set; skipping formatted template update")
@@ -1825,7 +1877,7 @@ def update_formatted_template(pdf_bytes: bytes) -> dict[str, Any] | None:
     gc = gspread.authorize(sheets_creds)
     drive = get_drive_service(load_drive_credentials())
 
-    when = _now_ist()
+    when = _now_ist(when or run_moment())
     monthly_file_name = current_month_tab_name(when)
     spreadsheet = get_or_create_monthly_spreadsheet(drive, gc, monthly_file_name)
 
@@ -1869,8 +1921,8 @@ def update_formatted_template(pdf_bytes: bytes) -> dict[str, Any] | None:
     month_header = str(metrics.get("month_header") or "")
     month_abbr = str(metrics.get("month_abbr") or "")
     if not month_header or not month_abbr:
-        month_header, month_abbr = _month_labels_from_ist()
-    _update_month_headers(worksheet, month_header, month_abbr)
+        month_header, month_abbr = _month_labels_from_ist(when)
+    _update_month_headers(worksheet, month_header, month_abbr, now=when)
 
     # Fresh snapshot each run: clear only mapped columns, never the merged spacers
     clear_end = min(worksheet.row_count, 120)
@@ -1959,10 +2011,17 @@ def send_bulletin_link_email(result: dict[str, Any]) -> None:
 
 
 def run() -> None:
-    logger.info("Starting FM Orders Bulletin job")
+    when = run_moment()
+    logger.info(
+        "Starting FM Orders Bulletin job (effective date=%s%s)",
+        when.date().isoformat(),
+        f", RUN_DATE={RUN_DATE}" if RUN_DATE else "",
+    )
     gmail_creds = load_gmail_credentials()
     gmail = get_gmail_service(gmail_creds)
-    message_id = find_latest_message_id(gmail, EMAIL_SUBJECT)
+    message_id = find_latest_message_id(
+        gmail, EMAIL_SUBJECT, on_day=when.date() if RUN_DATE else None
+    )
     pdf_bytes = download_pdf_attachment(gmail, message_id)
 
     # Production path: dated tabs inside the monthly Shared Drive file.
@@ -1970,12 +2029,19 @@ def run() -> None:
     # configured — and must never abort the formatted write (a 403 on that
     # old sheet was failing the whole daily job after Gemini had already run).
     if TEMPLATE_SHEET_ID:
-        result = update_formatted_template(pdf_bytes)
-        if result:
+        result = update_formatted_template(pdf_bytes, when=when)
+        if result and not RUN_DATE:
+            # Skip mail during backfills so operators are not spammed.
             try:
                 send_bulletin_link_email(result)
             except Exception:
                 logger.exception("Could not send the bulletin link mail")
+        elif result and RUN_DATE:
+            logger.info(
+                "Skipping notification mail for backfill RUN_DATE=%s (tab %r)",
+                RUN_DATE,
+                result.get("tab_name"),
+            )
     else:
         rows = extract_table_with_gemini(pdf_bytes)
         write_to_sheet(rows)
