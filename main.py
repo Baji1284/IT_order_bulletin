@@ -74,6 +74,25 @@ TEMPLATE_COL_PROJ_INCL = os.environ.get("TEMPLATE_COL_PROJ_INCL", "X").strip()
 TEMPLATE_COL_PROJ_DIGI = os.environ.get("TEMPLATE_COL_PROJ_DIGI", "Y").strip()
 TEMPLATE_COL_ACH_INCL = os.environ.get("TEMPLATE_COL_ACH_INCL", "Z").strip()
 TEMPLATE_COL_ACH_DIGI = os.environ.get("TEMPLATE_COL_ACH_DIGI", "AA").strip()
+# Previous-month block (MARCH'26 section in the template = cols M-P)
+TEMPLATE_PREV_MONTH_HEADER_CELL = os.environ.get(
+    "TEMPLATE_PREV_MONTH_HEADER_CELL", "M2"
+).strip()
+TEMPLATE_COL_PREV_MONTH_PROJ_INCL = os.environ.get(
+    "TEMPLATE_COL_PREV_MONTH_PROJ_INCL", "M"
+).strip()
+TEMPLATE_COL_PREV_MONTH_PROJ_DIGI = os.environ.get(
+    "TEMPLATE_COL_PREV_MONTH_PROJ_DIGI", "N"
+).strip()
+TEMPLATE_COL_PREV_MONTH_ACH_INCL = os.environ.get(
+    "TEMPLATE_COL_PREV_MONTH_ACH_INCL", "O"
+).strip()
+TEMPLATE_COL_PREV_MONTH_ACH_DIGI = os.environ.get(
+    "TEMPLATE_COL_PREV_MONTH_ACH_DIGI", "P"
+).strip()
+# Fiscal-year section labels above the target / YTD blocks
+TEMPLATE_CUR_FY_LABEL_CELL = os.environ.get("TEMPLATE_CUR_FY_LABEL_CELL", "I2").strip()
+TEMPLATE_YTD_FY_LABEL_CELL = os.environ.get("TEMPLATE_YTD_FY_LABEL_CELL", "R2").strip()
 TEMPLATE_COL_SEGMENT = os.environ.get("TEMPLATE_COL_SEGMENT", "A").strip()
 TEMPLATE_COL_DIVISION = os.environ.get("TEMPLATE_COL_DIVISION", "B").strip()
 # Previous fiscal-year block headers (the full Apr-Mar year that has closed)
@@ -144,6 +163,14 @@ NOTIFY_FROM_EMAIL = os.environ.get("NOTIFY_FROM_EMAIL", GMAIL_USER_EMAIL).strip(
 # Optional backfill: YYYY-MM-DD in IST. When set, fetch that day's bulletin email
 # and write the matching dated tab (skips notification mail).
 RUN_DATE = os.environ.get("RUN_DATE", "").strip()
+# When true, only rewrite dynamic month/year headers on existing dated tabs
+# (no Gmail / Gemini). Use with RUN_DATE for one tab, or alone to repair the
+# whole current month file.
+HEADER_REPAIR_ONLY = os.environ.get("HEADER_REPAIR_ONLY", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 GMAIL_SEND_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
@@ -1697,9 +1724,11 @@ def _update_month_headers(
     month_abbr: str,
     now: datetime | None = None,
 ) -> None:
-    """Update APRIL'26-style section header and every date-dependent column title."""
+    """Update every date-dependent section / column title from the run date."""
     when = _now_ist(now)
     prev = _previous_month(when)
+    prev_header = prev.strftime("%B").upper() + "'" + prev.strftime("%y")
+    prev_abbr = prev.strftime("%b") + "'" + prev.strftime("%y")
     # The fiscal year runs Apr-Mar, so these cover April up to last month. In
     # January the previous month belongs to the year before, hence prev's own year.
     prev_span = f"Apr - {prev.strftime('%b')}'{prev.strftime('%y')}"
@@ -1710,6 +1739,9 @@ def _update_month_headers(
     closed_yy = f"{closed_end % 100:02d}"
     closed_span = f"{closed_end - 1} - {closed_end}"
     closed_growth_span = f"{closed_end - 2} - {closed_end - 1}"
+    # Open fiscal year label (Apr-Mar), e.g. Aug 2026 -> 2026 - 2027
+    open_fy_start = when.year if when.month >= 4 else when.year - 1
+    open_fy_span = f"{open_fy_start} - {open_fy_start + 1}"
 
     header_updates = [
         {"range": TEMPLATE_PREV_FY_LABEL_CELL, "values": [[closed_span]]},
@@ -1725,6 +1757,27 @@ def _update_month_headers(
             "range": f"{TEMPLATE_COL_PREV_FY_GROWTH}{TEMPLATE_HEADER_ROW}",
             "values": [[f"% Growth over \n {closed_growth_span}\n (AVG)"]],
         },
+        {"range": TEMPLATE_CUR_FY_LABEL_CELL, "values": [[open_fy_span]]},
+        {"range": TEMPLATE_YTD_FY_LABEL_CELL, "values": [[open_fy_span]]},
+        # Previous calendar month block (template's MARCH'26 section)
+        {"range": TEMPLATE_PREV_MONTH_HEADER_CELL, "values": [[prev_header]]},
+        {
+            "range": f"{TEMPLATE_COL_PREV_MONTH_PROJ_INCL}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Projections\n{prev_abbr}\n (incl. Digital Business)"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_PREV_MONTH_PROJ_DIGI}{TEMPLATE_HEADER_ROW}",
+            "values": [["Projections\n for Digital Sustenance"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_PREV_MONTH_ACH_INCL}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Achmnt \n {prev_abbr}\n (incl. Digital Business)"]],
+        },
+        {
+            "range": f"{TEMPLATE_COL_PREV_MONTH_ACH_DIGI}{TEMPLATE_HEADER_ROW}",
+            "values": [[f"Achmnt \n {prev_abbr}\n  for Digital Sustenance"]],
+        },
+        # Current calendar month block
         {"range": TEMPLATE_MONTH_HEADER_CELL, "values": [[month_header]]},
         {
             "range": f"{TEMPLATE_COL_PROJ_INCL}{TEMPLATE_HEADER_ROW}",
@@ -1757,22 +1810,19 @@ def _update_month_headers(
     ]
     worksheet.batch_update(header_updates, value_input_option="RAW")
     logger.info(
-        "Updated headers: %s=%r, month columns for %r, %s/%s = %r, %s = %r; "
-        "closed FY %r: %s/%s = 'Apr-Mar''%s', %s = %r",
+        "Updated headers: prev-month %s=%r / %r; current %s=%r / %r; "
+        "%s/%s = %r; open FY %r; closed FY %r",
+        TEMPLATE_PREV_MONTH_HEADER_CELL,
+        prev_header,
+        prev_abbr,
         TEMPLATE_MONTH_HEADER_CELL,
         month_header,
         month_abbr,
         TEMPLATE_COL_FY_TOTAL_ACHMNT,
         TEMPLATE_COL_FY_DIGI_SUSTENANCE,
         prev_span,
-        TEMPLATE_COL_FY_GROWTH,
-        growth_span,
+        open_fy_span,
         closed_span,
-        TEMPLATE_COL_PREV_FY_TOTAL_ACHMNT,
-        TEMPLATE_COL_PREV_FY_DIGI_SUSTENANCE,
-        closed_yy,
-        TEMPLATE_COL_PREV_FY_GROWTH,
-        closed_growth_span,
     )
 
 
@@ -1918,10 +1968,14 @@ def update_formatted_template(
     ]
     master_ws.batch_clear(data_ranges)
 
-    month_header = str(metrics.get("month_header") or "")
-    month_abbr = str(metrics.get("month_abbr") or "")
-    if not month_header or not month_abbr:
-        month_header, month_abbr = _month_labels_from_ist(when)
+    month_header, month_abbr = _month_labels_from_ist(when)
+    pdf_month = str(metrics.get("month_header") or "").strip()
+    if pdf_month and pdf_month != month_header:
+        logger.info(
+            "PDF month_header=%r differs from run-date %r; using run-date for column titles",
+            pdf_month,
+            month_header,
+        )
     _update_month_headers(worksheet, month_header, month_abbr, now=when)
 
     # Fresh snapshot each run: clear only mapped columns, never the merged spacers
@@ -2010,8 +2064,133 @@ def send_bulletin_link_email(result: dict[str, Any]) -> None:
     )
 
 
+def repair_month_headers(when: datetime | None = None) -> dict[str, Any]:
+    """
+    Rewrite dynamic month/year headers on existing dated tabs only.
+
+    No Gmail or Gemini calls. With RUN_DATE, repairs that one tab; otherwise
+    repairs every DD/MM/YYYY tab inside the current month's spreadsheet.
+    """
+    if not TEMPLATE_SHEET_ID:
+        raise RuntimeError("TEMPLATE_SHEET_ID is required for header repair")
+
+    when = _now_ist(when or run_moment())
+    sheets_creds = load_sheets_credentials()
+    if not sheets_creds.valid:
+        sheets_creds.refresh(Request())
+    gc = gspread.authorize(sheets_creds)
+    drive = get_drive_service(load_drive_credentials())
+
+    monthly_file_name = current_month_tab_name(when)
+    spreadsheet = get_or_create_monthly_spreadsheet(drive, gc, monthly_file_name)
+
+    if RUN_DATE:
+        targets = [(day_tab_name(when.date()), when)]
+    else:
+        targets = []
+        for ws in spreadsheet.worksheets():
+            try:
+                tab_day = datetime.strptime(ws.title, "%d/%m/%Y").replace(tzinfo=IST)
+            except ValueError:
+                continue
+            targets.append((ws.title, tab_day))
+
+    if not targets:
+        raise RuntimeError(
+            f"No dated tabs found to repair in {monthly_file_name!r}"
+        )
+
+    repaired = 0
+    for tab_name, tab_when in targets:
+        try:
+            worksheet = spreadsheet.worksheet(tab_name)
+        except gspread.WorksheetNotFound:
+            logger.warning("Tab %r not found; skipping", tab_name)
+            continue
+        month_header, month_abbr = _month_labels_from_ist(tab_when)
+        _update_month_headers(worksheet, month_header, month_abbr, now=tab_when)
+        repaired += 1
+        logger.info("Repaired headers on tab %r for %s", tab_name, tab_when.date())
+
+    return {
+        "file_name": monthly_file_name,
+        "file_id": spreadsheet.id,
+        "repaired_tabs": repaired,
+    }
+
+
+def repair_month_headers(when: datetime | None = None) -> dict[str, Any]:
+    """
+    Rewrite dynamic month/year headers on existing dated tabs only.
+
+    No Gmail or Gemini calls. With RUN_DATE, repairs that one tab; otherwise
+    repairs every DD/MM/YYYY tab inside the current month's spreadsheet.
+    """
+    if not TEMPLATE_SHEET_ID:
+        raise RuntimeError("TEMPLATE_SHEET_ID is required for header repair")
+
+    when = _now_ist(when or run_moment())
+    sheets_creds = load_sheets_credentials()
+    if not sheets_creds.valid:
+        sheets_creds.refresh(Request())
+    gc = gspread.authorize(sheets_creds)
+    drive = get_drive_service(load_drive_credentials())
+
+    monthly_file_name = current_month_tab_name(when)
+    spreadsheet = get_or_create_monthly_spreadsheet(drive, gc, monthly_file_name)
+
+    if RUN_DATE:
+        targets = [(day_tab_name(when.date()), when)]
+    else:
+        targets = []
+        for ws in spreadsheet.worksheets():
+            try:
+                tab_day = datetime.strptime(ws.title, "%d/%m/%Y").replace(tzinfo=IST)
+            except ValueError:
+                continue
+            targets.append((ws.title, tab_day))
+
+    if not targets:
+        raise RuntimeError(
+            f"No dated tabs found to repair in {monthly_file_name!r}"
+        )
+
+    repaired = 0
+    for tab_name, tab_when in targets:
+        try:
+            worksheet = spreadsheet.worksheet(tab_name)
+        except gspread.WorksheetNotFound:
+            logger.warning("Tab %r not found; skipping", tab_name)
+            continue
+        month_header, month_abbr = _month_labels_from_ist(tab_when)
+        _update_month_headers(worksheet, month_header, month_abbr, now=tab_when)
+        repaired += 1
+        logger.info("Repaired headers on tab %r for %s", tab_name, tab_when.date())
+
+    return {
+        "file_name": monthly_file_name,
+        "file_id": spreadsheet.id,
+        "repaired_tabs": repaired,
+    }
+
+
 def run() -> None:
     when = run_moment()
+    if HEADER_REPAIR_ONLY:
+        logger.info(
+            "Header-repair mode (effective date=%s%s)",
+            when.date().isoformat(),
+            f", RUN_DATE={RUN_DATE}" if RUN_DATE else ", all dated tabs",
+        )
+        result = repair_month_headers(when)
+        logger.info(
+            "Header repair done on %r (%d tab(s))",
+            result["file_name"],
+            result["repaired_tabs"],
+        )
+        logger.info("Job completed successfully")
+        return
+
     logger.info(
         "Starting FM Orders Bulletin job (effective date=%s%s)",
         when.date().isoformat(),
@@ -2026,12 +2205,11 @@ def run() -> None:
 
     # Production path: dated tabs inside the monthly Shared Drive file.
     # The legacy raw dump to GOOGLE_SHEET_ID is only used when no template is
-    # configured — and must never abort the formatted write (a 403 on that
+    # configured - and must never abort the formatted write (a 403 on that
     # old sheet was failing the whole daily job after Gemini had already run).
     if TEMPLATE_SHEET_ID:
         result = update_formatted_template(pdf_bytes, when=when)
         if result and not RUN_DATE:
-            # Skip mail during backfills so operators are not spammed.
             try:
                 send_bulletin_link_email(result)
             except Exception:
